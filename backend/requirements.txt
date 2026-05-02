@@ -1,0 +1,15 @@
+# WHY each dependency exists:
+# fastapi — async web framework that supports WebSockets natively
+# uvicorn — ASGI server that runs FastAPI (like gunicorn but for async)
+# websockets — WebSocket protocol implementation (required by uvicorn)
+# python-dotenv — loads .env file into os.environ for API keys
+# google-generativeai — official Google SDK for Gemini LLM and embeddings
+# numpy — used for cosine similarity in our vector store (replaces ChromaDB
+#          to avoid requiring C++ build tools on Windows)
+
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+websockets==15.0.1
+python-dotenv==1.1.0
+google-generativeai==0.8.5
+numpy==2.2.5
