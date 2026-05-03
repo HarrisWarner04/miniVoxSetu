@@ -74,7 +74,6 @@ cd backend
 pip install -r requirements.txt
 
 # Create .env file with your API key
-cp .env.example .env
 # Edit .env and paste your Gemini API key
 
 python main.py
