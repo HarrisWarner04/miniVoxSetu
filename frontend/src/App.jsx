@@ -1,26 +1,13 @@
 /**
- * miniVoxSetu — Main Application Component
- *
- * WHY THIS IS ONE BIG FILE INSTEAD OF MANY SMALL COMPONENTS:
- * This is a learning project. Splitting into 10 components would make you
- * jump between files to understand the flow. Voice AI has a LINEAR pipeline
- * (mic → STT → LLM → TTS → speaker) and keeping it in one file lets you
- * read that pipeline top to bottom. In production, you'd absolutely split this.
+ * miniVoxSetu — Phase 1 Upgrade
+ * STT: Deepgram (server-side) via streaming audio
+ * TTS: ElevenLabs (server-side) via audio playback
+ * Mic: Always-on after start (no click-per-message)
+ * Barge-in: Energy-based detection cancels TTS playback
  */
 
 import { useState, useRef, useCallback, useEffect } from 'react';
 
-// ============================================================
-// CONSTANTS
-// ============================================================
-
-/**
- * WHY THESE STATES EXIST:
- * Voice AI agents are state machines. At any moment, the system is in exactly
- * one of these states. The transitions between states define the conversation flow:
- *   IDLE → LISTENING → THINKING → SPEAKING → IDLE (or back to LISTENING on barge-in)
- * Understanding this state machine is key to understanding ALL voice AI systems.
- */
 const STATES = {
   IDLE: 'idle',
   LISTENING: 'listening',
@@ -36,253 +23,81 @@ const STATE_LABELS = {
 };
 
 // ============================================================
-// CUSTOM HOOK: useWebSocket
+// CUSTOM HOOK: useWebSocket (supports binary + text frames)
 // ============================================================
 
-/**
- * WHY A CUSTOM HOOK FOR WEBSOCKET:
- * The WebSocket connection is a long-lived resource that needs lifecycle
- * management (connect, reconnect, cleanup). Encapsulating it in a hook
- * keeps the main component focused on UI logic.
- */
 function useWebSocket(url) {
   const wsRef = useRef(null);
   const [isConnected, setIsConnected] = useState(false);
-  const onMessageRef = useRef(null);
+  const onTextMessageRef = useRef(null);
+  const hasConnectedRef = useRef(false);
 
   const connect = useCallback(() => {
-    // WHY: We check readyState to avoid creating duplicate connections.
-    // WebSockets are expensive resources — one connection per client is the rule.
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
     const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer'; // for receiving audio back
 
     ws.onopen = () => {
-      console.log('🔌 WebSocket connected');
+      hasConnectedRef.current = true;
       setIsConnected(true);
     };
 
     ws.onclose = () => {
-      console.log('🔌 WebSocket disconnected');
       setIsConnected(false);
-      // WHY: Auto-reconnect after 2 seconds. Network interruptions are common,
-      // and a voice AI agent that stops working after a blip is frustrating.
-      // In production, you'd use exponential backoff (2s, 4s, 8s...).
       setTimeout(connect, 2000);
     };
 
-    ws.onerror = (err) => {
-      console.error('❌ WebSocket error:', err);
+    ws.onerror = () => {
+      if (hasConnectedRef.current) {
+        console.error('WebSocket connection lost');
+      }
       ws.close();
     };
 
     ws.onmessage = (event) => {
-      if (onMessageRef.current) {
-        onMessageRef.current(JSON.parse(event.data));
+      // All messages from backend are JSON text (audio is base64 inside JSON)
+      if (typeof event.data === 'string' && onTextMessageRef.current) {
+        try {
+          onTextMessageRef.current(JSON.parse(event.data));
+        } catch (e) {
+          console.error('Failed to parse message:', e);
+        }
       }
     };
 
     wsRef.current = ws;
   }, [url]);
 
-  const send = useCallback((data) => {
+  // Send JSON text message
+  const sendJSON = useCallback((data) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(data));
     }
   }, []);
 
+  // Send binary audio data
+  const sendBinary = useCallback((data) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(data);
+    }
+  }, []);
+
   const setOnMessage = useCallback((handler) => {
-    onMessageRef.current = handler;
+    onTextMessageRef.current = handler;
   }, []);
 
   useEffect(() => {
     connect();
     return () => {
-      // WHY: Cleanup on unmount prevents memory leaks and zombie connections.
       if (wsRef.current) {
-        wsRef.current.onclose = null; // Prevent reconnect on intentional close
+        wsRef.current.onclose = null;
         wsRef.current.close();
       }
     };
   }, [connect]);
 
-  return { isConnected, send, setOnMessage };
-}
-
-// ============================================================
-// CUSTOM HOOK: useSpeechRecognition (STT)
-// ============================================================
-
-/**
- * WHY WE USE THE BROWSER'S WEB SPEECH API FOR STT:
- * 1. It's completely FREE — no API key, no usage limits
- * 2. It runs locally in the browser — no audio sent to our server
- * 3. It provides real-time interim results (partial transcripts as you speak)
- *
- * TRADEOFF: Quality is lower than cloud STT (Google Cloud Speech, Deepgram,
- * AssemblyAI). In production voice AI, you'd use a paid cloud STT service
- * for accuracy. But for learning the architecture, this is perfect.
- */
-function useSpeechRecognition() {
-  const recognitionRef = useRef(null);
-  const [isSupported, setIsSupported] = useState(true);
-
-  useEffect(() => {
-    // WHY: We check for browser support because Web Speech API isn't available
-    // everywhere (notably Firefox has limited support). Chrome is the gold standard.
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      setIsSupported(false);
-      return;
-    }
-
-    const recognition = new SpeechRecognition();
-
-    // WHY continuous=true: We want the mic to keep listening until WE stop it,
-    // not stop after one sentence. This is essential for natural conversation.
-    recognition.continuous = true;
-
-    // WHY interimResults=true: This gives us partial transcripts as the user
-    // speaks ("I want to..." → "I want to know..." → "I want to know my balance").
-    // This is what makes voice AI feel responsive — you see words appearing in
-    // real time. Without this, you'd wait for silence before seeing any text.
-    recognition.interimResults = true;
-    recognition.lang = 'en-US';
-
-    recognitionRef.current = recognition;
-  }, []);
-
-  const start = useCallback((onResult, onEnd) => {
-    const recognition = recognitionRef.current;
-    if (!recognition) return;
-
-    recognition.onresult = (event) => {
-      // WHY: We process ALL results, not just the latest one. The Speech API
-      // continuously refines its transcription — what it thought was "I wanna"
-      // might become "I want to" as more audio context arrives.
-      let interim = '';
-      let final = '';
-
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const transcript = event.results[i][0].transcript;
-        if (event.results[i].isFinal) {
-          final += transcript;
-        } else {
-          interim += transcript;
-        }
-      }
-
-      onResult({ interim, final });
-    };
-
-    recognition.onerror = (event) => {
-      // WHY: 'no-speech' and 'aborted' are normal — they happen when the user
-      // is silent or when we programmatically stop recognition. We don't want
-      // to treat these as real errors.
-      if (event.error !== 'no-speech' && event.error !== 'aborted') {
-        console.error('🎤 Speech recognition error:', event.error);
-      }
-    };
-
-    recognition.onend = () => {
-      if (onEnd) onEnd();
-    };
-
-    try {
-      recognition.start();
-    } catch (e) {
-      // WHY: start() throws if recognition is already running. This can happen
-      // during rapid state transitions (barge-in). Catching it prevents crashes.
-      console.warn('🎤 Recognition already started');
-    }
-  }, []);
-
-  const stop = useCallback(() => {
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch (e) {
-        // Safe to ignore — means it wasn't running
-      }
-    }
-  }, []);
-
-  return { start, stop, isSupported };
-}
-
-// ============================================================
-// CUSTOM HOOK: useSpeechSynthesis (TTS)
-// ============================================================
-
-/**
- * WHY WE USE THE BROWSER'S WEB SPEECH SYNTHESIS API FOR TTS:
- * Same reasons as STT — it's free and runs locally. The quality isn't
- * as good as cloud TTS (ElevenLabs, Google Cloud TTS, Amazon Polly),
- * but it's instant (no network latency) and costs nothing.
- *
- * CRITICAL FOR BARGE-IN: We need the ability to CANCEL speech mid-sentence.
- * The Web Speech Synthesis API supports this via speechSynthesis.cancel().
- * This is what makes barge-in possible — when the user interrupts, we kill
- * TTS immediately and switch back to listening.
- */
-function useSpeechSynthesis() {
-  // WHY: getVoices() returns an empty array on first call in many browsers.
-  // Voices are loaded asynchronously, so we cache them via the 'voiceschanged'
-  // event. Without this, the first TTS call may use the robotic default voice.
-  const voicesRef = useRef([]);
-
-  useEffect(() => {
-    const loadVoices = () => {
-      voicesRef.current = window.speechSynthesis.getVoices();
-    };
-    loadVoices();
-    window.speechSynthesis.addEventListener('voiceschanged', loadVoices);
-    return () => {
-      window.speechSynthesis.removeEventListener('voiceschanged', loadVoices);
-    };
-  }, []);
-
-  const speak = useCallback((text, onEnd) => {
-    // WHY: We cancel any ongoing speech before starting new speech.
-    // This prevents overlapping utterances and ensures clean transitions.
-    window.speechSynthesis.cancel();
-
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 1.05; // WHY: Slightly faster than default feels more natural for AI
-    utterance.pitch = 1.0;
-
-    // WHY: We try to pick a good voice. The default voice on many systems
-    // sounds robotic. Selecting a specific voice (like "Google UK English Female")
-    // dramatically improves the experience.
-    const voices = voicesRef.current;
-    const preferred = voices.find(v =>
-      v.name.includes('Google') && v.lang.startsWith('en')
-    ) || voices.find(v => v.lang.startsWith('en'));
-    if (preferred) utterance.voice = preferred;
-
-    utterance.onend = () => {
-      if (onEnd) onEnd();
-    };
-
-    window.speechSynthesis.speak(utterance);
-  }, []);
-
-  /**
-   * WHY THIS CANCEL FUNCTION IS CRITICAL:
-   * In real voice AI, barge-in means the user starts talking while the AI
-   * is still speaking. The AI must IMMEDIATELY shut up and listen.
-   * "Immediately" means < 200ms — any longer and the user feels ignored.
-   * speechSynthesis.cancel() is synchronous, so it's instant.
-   */
-  const cancel = useCallback(() => {
-    window.speechSynthesis.cancel();
-  }, []);
-
-  const isSpeaking = useCallback(() => {
-    return window.speechSynthesis.speaking;
-  }, []);
-
-  return { speak, cancel, isSpeaking };
+  return { isConnected, sendJSON, sendBinary, setOnMessage, wsRef };
 }
 
 // ============================================================
@@ -290,408 +105,383 @@ function useSpeechSynthesis() {
 // ============================================================
 
 export default function App() {
-  // --- Core state ---
+  // --- Connection ---
+  const { isConnected, sendJSON, sendBinary, setOnMessage, wsRef } =
+    useWebSocket('ws://localhost:8000/ws/chat');
+
+  // --- Agent state machine ---
   const [agentState, setAgentState] = useState(STATES.IDLE);
-  /**
-   * WHY WE KEEP CONVERSATION HISTORY IN STATE:
-   * This array IS the AI's memory. Every time we call the LLM, we send this
-   * entire array. The LLM has no memory between calls — this array is how it
-   * knows what was said before. This is the "context window" concept.
-   * We display it in the UI so you can literally SEE the memory being built.
-   */
-  const [conversationHistory, setConversationHistory] = useState([]);
+  const agentStateRef = useRef(STATES.IDLE);
+
+  // --- Transcript ---
   const [liveTranscript, setLiveTranscript] = useState('');
   const [interimTranscript, setInterimTranscript] = useState('');
   const [streamingResponse, setStreamingResponse] = useState('');
+
+  // --- Conversation ---
+  const [conversationHistory, setConversationHistory] = useState([]);
   const [ragChunks, setRagChunks] = useState([]);
   const [ragQuery, setRagQuery] = useState('');
 
-  // --- Refs for values needed in callbacks ---
-  /**
-   * WHY REFS INSTEAD OF STATE FOR SOME VALUES:
-   * Callbacks (WebSocket handlers, speech recognition handlers) capture
-   * state values at creation time (closure). Using refs gives us access to
-   * the CURRENT value, not the stale captured value. This is a common React
-   * pattern for values that change frequently and are read in async callbacks.
-   */
-  const agentStateRef = useRef(STATES.IDLE);
-  const accumulatedTextRef = useRef('');
-  const fullResponseRef = useRef('');
-  const historyRef = useRef([]);
+  // --- Semantic intelligence ---
+  const [semanticData, setSemanticData] = useState(null);
+  const [semanticLatency, setSemanticLatency] = useState(0);
+
+  // --- Text input fallback ---
+  const [textInput, setTextInput] = useState('');
+
+  // --- Error ---
+  const [sttError, setSttError] = useState('');
+
+  // --- Audio recording ---
+  const mediaRecorderRef = useRef(null);
+  const mediaStreamRef = useRef(null);
+  const isRecordingRef = useRef(false);
+
+  // --- Audio playback ---
+  const audioQueueRef = useRef([]);
+  const isPlayingRef = useRef(false);
+  const currentAudioSourceRef = useRef(null);
+  const audioContextRef = useRef(null);
+
+  // --- VAD / Barge-in ---
+  const analyserRef = useRef(null);
+  const vadIntervalRef = useRef(null);
+
+  // --- Refs ---
   const historyPanelRef = useRef(null);
+  const pendingUtteranceRef = useRef('');
 
-  // Keep refs in sync with state
-  useEffect(() => { agentStateRef.current = agentState; }, [agentState]);
-  useEffect(() => { historyRef.current = conversationHistory; }, [conversationHistory]);
+  // Sync state to ref for use in callbacks
+  useEffect(() => {
+    agentStateRef.current = agentState;
+  }, [agentState]);
 
-  // --- Initialize hooks ---
-  // WHY: We use the current page's host so the WebSocket goes through Vite's
-  // proxy (configured in vite.config.js). Hardcoding port 8000 bypasses the
-  // proxy and would break in production behind a reverse proxy.
-  const { isConnected, send, setOnMessage } = useWebSocket(
-    `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/chat`
-  );
-  const { start: startSTT, stop: stopSTT, isSupported: sttSupported } = useSpeechRecognition();
-  const { speak, cancel: cancelTTS } = useSpeechSynthesis();
-
-  // Auto-scroll history panel when new turns are added
+  // Auto-scroll conversation history
   useEffect(() => {
     if (historyPanelRef.current) {
       historyPanelRef.current.scrollTop = historyPanelRef.current.scrollHeight;
     }
-  }, [conversationHistory, streamingResponse]);
-
-  // WHY: If the WebSocket disconnects mid-conversation (server restart, network
-  // issue), the UI gets stuck in THINKING or SPEAKING forever because no more
-  // messages will arrive. This safety net resets the state machine.
-  useEffect(() => {
-    if (!isConnected && (agentState === STATES.THINKING || agentState === STATES.SPEAKING)) {
-      cancelTTS();
-      setAgentState(STATES.IDLE);
-      setStreamingResponse('');
-      setLiveTranscript('');
-    }
-  }, [isConnected, agentState, cancelTTS]);
-
-  // WHY: Cleanup VAD resources on unmount to prevent memory leaks.
-  // MediaStreams and AudioContexts are expensive system resources.
-  useEffect(() => {
-    return () => {
-      if (vadIntervalRef.current) clearInterval(vadIntervalRef.current);
-      if (mediaStreamRef.current) mediaStreamRef.current.getTracks().forEach(t => t.stop());
-      if (audioContextRef.current) audioContextRef.current.close();
-    };
-  }, []);
+  }, [conversationHistory]);
 
   // ============================================================
-  // BARGE-IN DETECTION (VAD — Voice Activity Detection)
+  // AUDIO RECORDING (always-on mic via MediaRecorder)
   // ============================================================
 
-  /**
-   * WHY BARGE-IN MATTERS:
-   * In natural human conversation, people interrupt each other constantly.
-   * If the AI can't handle interruption, it feels like talking to a machine.
-   * Barge-in means: if the user starts speaking while the AI is talking,
-   * IMMEDIATELY stop the AI's speech and start listening to the user.
-   *
-   * HOW WE DETECT IT:
-   * We use audio energy detection — we capture the microphone stream,
-   * analyze the audio levels, and if the energy exceeds a threshold while
-   * the AI is speaking, we trigger barge-in. This is a simplified version
-   * of what production systems use (they use ML-based VAD models like Silero).
-   */
-  const audioContextRef = useRef(null);
-  const analyserRef = useRef(null);
-  const mediaStreamRef = useRef(null);
-  const vadIntervalRef = useRef(null);
-
-  const startVAD = useCallback(async () => {
-    // WHY: Guard against creating duplicate AudioContexts from rapid mic clicks.
-    // Each AudioContext consumes system resources, and browsers limit the count.
-    if (analyserRef.current && audioContextRef.current?.state !== 'closed') return;
-
+  const startRecording = useCallback(async () => {
     try {
-      // WHY: getUserMedia requests microphone access. This is the WebRTC API
-      // that all voice AI systems use to capture audio from the user's mic.
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          sampleRate: 48000,
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
+      });
+
       mediaStreamRef.current = stream;
 
+      // Set up AnalyserNode for VAD energy detection (barge-in)
       const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       audioContextRef.current = audioCtx;
-
       const source = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
-      // WHY fftSize=512: Smaller FFT = faster updates but less frequency resolution.
-      // For VAD we only care about energy level, not frequency detail, so 512 is fine.
       analyser.fftSize = 512;
       source.connect(analyser);
       analyserRef.current = analyser;
-    } catch (err) {
-      console.error('❌ Microphone access denied:', err);
-    }
-  }, []);
 
-  const stopVAD = useCallback(() => {
-    if (vadIntervalRef.current) {
-      clearInterval(vadIntervalRef.current);
-      vadIntervalRef.current = null;
+      // MediaRecorder sends audio chunks to backend
+      const recorder = new MediaRecorder(stream, {
+        mimeType: 'audio/webm;codecs=opus',
+      });
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0 && isRecordingRef.current) {
+          sendBinary(e.data);
+        }
+      };
+
+      recorder.start(250); // 250ms chunks
+      mediaRecorderRef.current = recorder;
+      isRecordingRef.current = true;
+
+      // Start barge-in energy monitoring
+      startBargeInDetection();
+
+      setAgentState(STATES.LISTENING);
+      setSttError('');
+    } catch (err) {
+      console.error('Mic access failed:', err);
+      setSttError('Microphone access denied. Please allow mic access.');
     }
+  }, [sendBinary]);
+
+  const stopRecording = useCallback(() => {
+    isRecordingRef.current = false;
+
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+
     if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach(t => t.stop());
+      mediaStreamRef.current.getTracks().forEach((t) => t.stop());
       mediaStreamRef.current = null;
     }
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-  }, []);
 
-  /**
-   * WHY WE MONITOR AUDIO ENERGY DURING SPEAKING STATE:
-   * We only run the VAD check while the AI is speaking. If the audio energy
-   * exceeds our threshold, it means the user is talking → trigger barge-in.
-   * We poll every 100ms which gives us ~100ms detection latency — well under
-   * the 200ms threshold that feels responsive to humans.
-   */
-  const startBargeInDetection = useCallback(() => {
-    if (!analyserRef.current) return;
-
-    // WHY: Clear any existing interval to prevent accumulation from repeated
-    // mic clicks. Without this, each click adds a NEW interval — after 5 clicks
-    // you'd have 5 intervals all checking audio energy simultaneously.
     if (vadIntervalRef.current) {
       clearInterval(vadIntervalRef.current);
       vadIntervalRef.current = null;
     }
 
-    const analyser = analyserRef.current;
-    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+    setAgentState(STATES.IDLE);
+  }, []);
+
+  // ============================================================
+  // BARGE-IN DETECTION (energy threshold on AnalyserNode)
+  // ============================================================
+
+  const startBargeInDetection = useCallback(() => {
+    if (vadIntervalRef.current) clearInterval(vadIntervalRef.current);
+
+    const ENERGY_THRESHOLD = 30;
 
     vadIntervalRef.current = setInterval(() => {
-      // WHY: We only check for barge-in when the AI is speaking.
-      // Checking at other times would cause false triggers.
+      if (!analyserRef.current) return;
       if (agentStateRef.current !== STATES.SPEAKING) return;
 
-      analyser.getByteFrequencyData(dataArray);
-      // WHY: Average energy across frequency bins gives us a simple
-      // "how loud is the input" measure. This is crude but effective.
-      const average = dataArray.reduce((sum, val) => sum + val, 0) / dataArray.length;
+      const data = new Uint8Array(analyserRef.current.frequencyBinCount);
+      analyserRef.current.getByteFrequencyData(data);
+      const avg = data.reduce((a, b) => a + b, 0) / data.length;
 
-      // WHY threshold=30: This is tuned to ignore background noise but
-      // catch speech. You may need to adjust for your environment.
-      // In production, you'd use a proper ML-based VAD (Silero VAD).
-      if (average > 30) {
-        console.log('🛑 BARGE-IN detected! Energy:', average.toFixed(1));
+      if (avg > ENERGY_THRESHOLD) {
         handleBargeIn();
       }
     }, 100);
   }, []);
 
   // ============================================================
-  // CORE VOICE AI PIPELINE
+  // BARGE-IN HANDLER
   // ============================================================
 
-  /**
-   * WHY THIS IS THE MOST IMPORTANT FUNCTION:
-   * This is the barge-in handler — when the user interrupts the AI.
-   * It must:
-   * 1. Cancel TTS immediately (< 200ms latency requirement)
-   * 2. Switch state to LISTENING
-   * 3. Restart speech recognition
-   * Speed is everything here — any delay and the user feels ignored.
-   */
   const handleBargeIn = useCallback(() => {
-    console.log('🛑 Executing barge-in');
-    // WHY: cancel() is synchronous — TTS stops INSTANTLY.
-    cancelTTS();
-    setAgentState(STATES.LISTENING);
-    setStreamingResponse('');
-    fullResponseRef.current = '';
-    // Restart listening immediately
-    startListening();
-  }, [cancelTTS]);
-
-  /**
-   * WHY: This starts the speech recognition and handles incoming transcripts.
-   * We accumulate final transcripts (confirmed words) and show interim
-   * transcripts (tentative words) separately for a real-time feel.
-   */
-  const startListening = useCallback(() => {
-    setAgentState(STATES.LISTENING);
-    accumulatedTextRef.current = '';
-    setLiveTranscript('');
-    setInterimTranscript('');
-
-    startSTT(
-      // onResult callback — called every time the Speech API has new text
-      ({ interim, final: finalText }) => {
-        if (finalText) {
-          accumulatedTextRef.current += finalText;
-          setLiveTranscript(accumulatedTextRef.current);
-        }
-        setInterimTranscript(interim);
-      },
-      // onEnd callback — called when speech recognition stops
-      () => {
-        // WHY: Speech recognition can stop on its own (timeout, browser decides
-        // user stopped talking). If we were listening and got text, process it.
-        // If no text, go back to idle.
-        if (agentStateRef.current === STATES.LISTENING) {
-          const text = accumulatedTextRef.current.trim();
-          if (text) {
-            processUserInput(text);
-          }
-        }
-      }
-    );
-  }, [startSTT]);
-
-  /**
-   * WHY: When the user stops talking (clicks mic button again), we take
-   * whatever they said, add it to conversation history, and send it to
-   * the LLM. This is the STT → LLM handoff.
-   */
-  const stopListeningAndProcess = useCallback(() => {
-    stopSTT();
-    const text = accumulatedTextRef.current.trim();
-    if (text) {
-      processUserInput(text);
-    } else {
-      setAgentState(STATES.IDLE);
+    // Stop TTS audio playback
+    if (currentAudioSourceRef.current) {
+      try {
+        currentAudioSourceRef.current.stop();
+      } catch (e) { /* already stopped */ }
+      currentAudioSourceRef.current = null;
     }
-  }, [stopSTT]);
+    audioQueueRef.current = [];
+    isPlayingRef.current = false;
 
-  /**
-   * WHY THIS FUNCTION IS THE CORE OF THE PIPELINE:
-   * It takes the user's spoken text, adds it to conversation history,
-   * and sends it (along with FULL history) to the backend via WebSocket.
-   * The backend will:
-   * 1. Search RAG for relevant FAQ chunks
-   * 2. Call Gemini with the full history + RAG context
-   * 3. Stream the response back token by token
-   */
-  const processUserInput = useCallback((text) => {
-    setAgentState(STATES.THINKING);
-    setInterimTranscript('');
+    // Tell backend to cancel pipeline
+    sendJSON({ type: 'barge_in' });
+
+    // Reset UI
     setStreamingResponse('');
-    fullResponseRef.current = '';
+    setAgentState(STATES.LISTENING);
+  }, [sendJSON]);
 
-    // WHY: We add the user's turn to history BEFORE sending to the LLM.
-    // This ensures the history array always has the complete conversation
-    // up to this point. The LLM needs this to maintain conversational context.
-    const newHistory = [
-      ...historyRef.current,
-      { role: 'user', content: text }
-    ];
-    setConversationHistory(newHistory);
+  // ============================================================
+  // AUDIO PLAYBACK (play TTS audio from backend)
+  // ============================================================
 
-    // WHY: We send the FULL conversation history every time because the
-    // LLM API is stateless — it has NO memory between calls. The history
-    // array IS the model's memory. This is the "context window" concept
-    // that's fundamental to all LLM-powered agents.
-    send({
-      text,
-      history: historyRef.current, // Send previous history (without current user turn, it's in 'text')
-    });
-  }, [send]);
+  const playNextAudio = useCallback(async () => {
+    if (isPlayingRef.current || audioQueueRef.current.length === 0) return;
+
+    isPlayingRef.current = true;
+    const audioData = audioQueueRef.current.shift();
+
+    try {
+      const audioCtx = audioContextRef.current;
+      if (!audioCtx) return;
+
+      // Resume AudioContext if suspended (browser autoplay policy)
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+
+      const audioBuffer = await audioCtx.decodeAudioData(audioData.buffer);
+      const source = audioCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(audioCtx.destination);
+
+      currentAudioSourceRef.current = source;
+
+      source.onended = () => {
+        currentAudioSourceRef.current = null;
+        isPlayingRef.current = false;
+        // Play next queued audio or return to listening
+        if (audioQueueRef.current.length > 0) {
+          playNextAudio();
+        }
+      };
+
+      source.start(0);
+    } catch (err) {
+      console.error('Audio playback error:', err);
+      isPlayingRef.current = false;
+      // Try next in queue
+      if (audioQueueRef.current.length > 0) {
+        playNextAudio();
+      }
+    }
+  }, []);
+
+  const queueAudio = useCallback((base64Data) => {
+    const binaryStr = atob(base64Data);
+    const bytes = new Uint8Array(binaryStr.length);
+    for (let i = 0; i < binaryStr.length; i++) {
+      bytes[i] = binaryStr.charCodeAt(i);
+    }
+    audioQueueRef.current.push(bytes);
+    playNextAudio();
+  }, [playNextAudio]);
 
   // ============================================================
   // WEBSOCKET MESSAGE HANDLER
   // ============================================================
 
-  /**
-   * WHY: This handles messages streaming back from the backend.
-   * The backend sends three types of messages:
-   * 1. "rag_context" — what FAQ chunks were retrieved (for transparency)
-   * 2. "chunk" — a piece of the LLM response (streaming)
-   * 3. "done" — the complete response is finished
-   * 4. "error" — something went wrong
-   */
   useEffect(() => {
     setOnMessage((message) => {
       switch (message.type) {
+        case 'transcript':
+          // Live STT from Deepgram
+          if (message.is_final) {
+            setLiveTranscript((prev) => (prev + ' ' + message.text).trim());
+            setInterimTranscript('');
+            pendingUtteranceRef.current =
+              (pendingUtteranceRef.current + ' ' + message.text).trim();
+          } else {
+            setInterimTranscript(message.text);
+          }
+          break;
+
+        case 'utterance':
+          // Full utterance ready (for display)
+          setLiveTranscript(message.text);
+          setInterimTranscript('');
+          break;
+
+        case 'state':
+          // Backend state change
+          if (message.state === 'THINKING') {
+            setAgentState(STATES.THINKING);
+            setStreamingResponse('');
+            setLiveTranscript(pendingUtteranceRef.current || '');
+            pendingUtteranceRef.current = '';
+          } else if (message.state === 'SPEAKING') {
+            setAgentState(STATES.SPEAKING);
+          } else if (message.state === 'LISTENING') {
+            setAgentState(STATES.LISTENING);
+          }
+          break;
+
         case 'rag_context':
-          // WHY: We show RAG results in the UI so you can SEE what the
-          // retrieval system found. This is crucial for debugging RAG quality
-          // in production — if the wrong chunks are retrieved, the AI will
-          // give wrong answers. Transparency > magic.
           setRagChunks(message.chunks || []);
           setRagQuery(message.query || '');
           break;
 
         case 'chunk':
-          // WHY: Each chunk is appended to build the response incrementally.
-          // We show this in the UI as "streaming text" — you see the AI's
-          // response being generated word by word, just like ChatGPT.
-          fullResponseRef.current += message.text;
-          setStreamingResponse(fullResponseRef.current);
-          // Transition to SPEAKING on first chunk
-          if (agentStateRef.current === STATES.THINKING) {
-            setAgentState(STATES.SPEAKING);
-          }
+          // LLM streaming text
+          setStreamingResponse((prev) => prev + message.text);
+          break;
+
+        case 'audio':
+          // TTS audio from ElevenLabs (base64 mp3)
+          queueAudio(message.data);
           break;
 
         case 'done': {
-          // WHY: When the full response is complete, we:
-          // 1. Add the assistant's turn to conversation history
-          // 2. Speak the response via TTS
-          // 3. The history now has the complete exchange for the next turn
-          const fullText = message.full_text;
-
-          setConversationHistory(prev => [
-            ...prev,
-            { role: 'assistant', content: fullText }
-          ]);
-
-          setAgentState(STATES.SPEAKING);
-
-          // WHY: We start TTS with the complete response. When TTS finishes,
-          // we transition back to IDLE. If the user barge-ins during TTS,
-          // the barge-in handler will cancel TTS and go to LISTENING instead.
-          speak(fullText, () => {
-            // WHY: Check state because barge-in might have already changed it.
-            // If we blindly set IDLE here, we'd override the LISTENING state
-            // that barge-in set, breaking the flow.
-            if (agentStateRef.current === STATES.SPEAKING) {
-              setAgentState(STATES.IDLE);
-              setStreamingResponse('');
-              setLiveTranscript('');
+          const fullText = message.full_text || '';
+          setConversationHistory((prev) => {
+            const userText = pendingUtteranceRef.current || liveTranscript || '';
+            const newHistory = [...prev];
+            if (userText) {
+              newHistory.push({ role: 'user', content: userText });
             }
+            newHistory.push({ role: 'assistant', content: fullText });
+            return newHistory;
           });
+          setStreamingResponse('');
+          // State will be set to LISTENING by backend 'state' message
+          // or when all audio finishes playing
           break;
         }
 
+        case 'semantic':
+          // Semantic intelligence from parallel analysis
+          setSemanticData(message.data);
+          setSemanticLatency(message.latency_ms || 0);
+          break;
+
         case 'error':
-          console.error('❌ Server error:', message.message);
-          setAgentState(STATES.IDLE);
-          setStreamingResponse(`Error: ${message.message}`);
+          console.error('Server error:', message.message);
+          setSttError(message.message);
+          setAgentState(STATES.LISTENING);
           break;
 
         default:
           break;
       }
     });
-  }, [setOnMessage, speak]);
+  }, [setOnMessage, queueAudio, liveTranscript]);
 
   // ============================================================
   // MIC BUTTON HANDLER
   // ============================================================
 
-  /**
-   * WHY: The mic button is a toggle:
-   * - If IDLE → start listening (and start VAD for barge-in detection)
-   * - If LISTENING → stop listening and process the text
-   * - If SPEAKING → manual barge-in (user clicks mic while AI talks)
-   * - If THINKING → do nothing (wait for the LLM)
-   */
   const handleMicClick = useCallback(async () => {
     switch (agentState) {
       case STATES.IDLE:
-        await startVAD();
-        startBargeInDetection();
-        startListening();
+        await startRecording();
         break;
 
       case STATES.LISTENING:
-        stopListeningAndProcess();
+        stopRecording();
         break;
 
       case STATES.SPEAKING:
-        // WHY: Clicking mic while AI speaks is a manual barge-in.
-        // Same effect as voice barge-in but triggered by button.
         handleBargeIn();
         break;
 
       case STATES.THINKING:
-        // WHY: We don't allow interruption during thinking because
-        // the LLM is mid-generation. We could cancel the request,
-        // but that adds complexity without teaching new concepts.
         break;
 
       default:
         break;
     }
-  }, [agentState, startVAD, startBargeInDetection, startListening, stopListeningAndProcess, handleBargeIn]);
+  }, [agentState, startRecording, stopRecording, handleBargeIn]);
+
+  // ============================================================
+  // TEXT INPUT FALLBACK
+  // ============================================================
+
+  const handleTextSubmit = useCallback(
+    (e) => {
+      e.preventDefault();
+      if (!textInput.trim() || !isConnected) return;
+
+      sendJSON({
+        type: 'text_input',
+        text: textInput,
+        history: conversationHistory,
+      });
+
+      setLiveTranscript(textInput);
+      setStreamingResponse('');
+      setAgentState(STATES.THINKING);
+      setTextInput('');
+    },
+    [textInput, isConnected, sendJSON, conversationHistory]
+  );
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopRecording();
+    };
+  }, [stopRecording]);
 
   // ============================================================
   // RENDER
@@ -703,12 +493,16 @@ export default function App() {
       <header className="header">
         <h1 className="header__title">miniVoxSetu</h1>
         <p className="header__subtitle">
-          Learn voice AI by building one — STT → LLM → TTS with RAG &amp; barge-in
+          Voice AI Pipeline — Deepgram STT → Gemini LLM → ElevenLabs TTS
         </p>
       </header>
 
       {/* --- Connection Status --- */}
-      <div className={`connection-bar ${isConnected ? 'connection-bar--connected' : 'connection-bar--disconnected'}`}>
+      <div
+        className={`connection-bar ${
+          isConnected ? 'connection-bar--connected' : 'connection-bar--disconnected'
+        }`}
+      >
         <span className="connection-dot" />
         {isConnected ? 'Backend Connected' : 'Connecting to backend...'}
       </div>
@@ -717,10 +511,24 @@ export default function App() {
       <div className="mic-area">
         <button
           id="mic-button"
-          className={`mic-button ${agentState === STATES.LISTENING ? 'mic-button--active' : ''}`}
+          className={`mic-button ${
+            agentState === STATES.LISTENING
+              ? 'mic-button--active'
+              : agentState === STATES.SPEAKING
+              ? 'mic-button--speaking'
+              : ''
+          }`}
           onClick={handleMicClick}
-          disabled={!isConnected || !sttSupported || agentState === STATES.THINKING}
-          aria-label={agentState === STATES.LISTENING ? 'Stop listening' : 'Start listening'}
+          disabled={!isConnected || agentState === STATES.THINKING}
+          aria-label={
+            agentState === STATES.IDLE
+              ? 'Start listening'
+              : agentState === STATES.LISTENING
+              ? 'Stop listening'
+              : agentState === STATES.SPEAKING
+              ? 'Interrupt (barge-in)'
+              : 'Processing...'
+          }
         >
           <MicIcon />
         </button>
@@ -728,17 +536,54 @@ export default function App() {
         <div className={`state-label state-label--${agentState}`} id="state-label">
           {agentState === STATES.THINKING && (
             <span className="thinking-dots">
-              <span /><span /><span />
+              <span />
+              <span />
+              <span />
             </span>
           )}
-          {STATE_LABELS[agentState]}
+          {agentState === STATES.IDLE
+            ? 'Click mic to start'
+            : agentState === STATES.LISTENING
+            ? 'Listening (always-on mic)'
+            : STATE_LABELS[agentState]}
         </div>
 
-        {!sttSupported && (
-          <p style={{ color: 'var(--accent-red)', fontSize: '0.8rem' }}>
-            ⚠ Speech recognition not supported. Use Chrome or Edge.
-          </p>
+        {/* --- Error Message --- */}
+        {sttError && (
+          <div className="stt-error" id="stt-error">
+            <span className="stt-error__icon">⚠</span>
+            <span className="stt-error__text">{sttError}</span>
+            <button
+              className="stt-error__dismiss"
+              onClick={() => setSttError('')}
+              aria-label="Dismiss error"
+            >
+              ✕
+            </button>
+          </div>
         )}
+
+        {/* --- Text Input Fallback --- */}
+        <form className="text-input-form" onSubmit={handleTextSubmit} id="text-input-form">
+          <input
+            type="text"
+            className="text-input"
+            id="text-input"
+            placeholder="Or type a message..."
+            value={textInput}
+            onChange={(e) => setTextInput(e.target.value)}
+            disabled={!isConnected || agentState === STATES.THINKING}
+          />
+          <button
+            type="submit"
+            className="text-input-send"
+            id="text-input-send"
+            disabled={!textInput.trim() || !isConnected || agentState === STATES.THINKING}
+            aria-label="Send message"
+          >
+            <SendIcon />
+          </button>
+        </form>
       </div>
 
       {/* --- Live Transcript Panel --- */}
@@ -750,13 +595,8 @@ export default function App() {
           </span>
         </div>
         <div className="panel__body">
-          {(liveTranscript || interimTranscript || streamingResponse) ? (
+          {liveTranscript || interimTranscript || streamingResponse ? (
             <div className="transcript">
-              {/* WHY: We show THREE things in the transcript panel:
-                  1. Final transcript (confirmed user speech) — white
-                  2. Interim transcript (tentative user speech) — gray italic
-                  3. Streaming AI response — blue with cursor
-                  This mirrors what production STT dashboards show. */}
               {liveTranscript && <span>{liveTranscript} </span>}
               {interimTranscript && (
                 <span className="transcript__interim">{interimTranscript}</span>
@@ -773,24 +613,99 @@ export default function App() {
             </div>
           ) : (
             <p className="transcript transcript--empty">
-              Click the mic and start speaking...
+              Click the mic to start speaking...
             </p>
+          )}
+        </div>
+      </div>
+
+      {/* --- Semantic Intelligence Panel --- */}
+      <div className="panel" id="semantic-panel" style={{ borderLeft: semanticData?.escalation_recommended ? '3px solid #ef4444' : '3px solid #6366f1' }}>
+        <div className="panel__header">
+          <span className="panel__title">Semantic Intelligence</span>
+          <span className="panel__badge">
+            {semanticLatency > 0 ? `${semanticLatency}ms` : 'waiting'}
+          </span>
+        </div>
+        <div className="panel__body">
+          {semanticData ? (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', fontSize: '0.85rem' }}>
+              {/* Intent */}
+              <div style={{ padding: '6px 10px', background: 'rgba(99,102,241,0.15)', borderRadius: '6px' }}>
+                <div style={{ color: '#a5b4fc', fontSize: '0.7rem', textTransform: 'uppercase', marginBottom: '2px' }}>Intent</div>
+                <div style={{ color: '#e0e7ff', fontWeight: 600 }}>{semanticData.intent}</div>
+              </div>
+
+              {/* Sentiment */}
+              <div style={{ padding: '6px 10px', background: 'rgba(99,102,241,0.15)', borderRadius: '6px' }}>
+                <div style={{ color: '#a5b4fc', fontSize: '0.7rem', textTransform: 'uppercase', marginBottom: '2px' }}>Sentiment</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <div style={{
+                    width: '60px', height: '6px', background: '#334155', borderRadius: '3px', overflow: 'hidden'
+                  }}>
+                    <div style={{
+                      width: `${Math.abs(semanticData.sentiment) * 100}%`,
+                      height: '100%',
+                      background: semanticData.sentiment >= 0 ? '#22c55e' : '#ef4444',
+                      borderRadius: '3px',
+                      marginLeft: semanticData.sentiment >= 0 ? '50%' : `${50 - Math.abs(semanticData.sentiment) * 50}%`,
+                    }} />
+                  </div>
+                  <span style={{ color: semanticData.sentiment >= 0 ? '#22c55e' : '#ef4444', fontWeight: 600 }}>
+                    {semanticData.sentiment > 0 ? '+' : ''}{semanticData.sentiment}
+                  </span>
+                </div>
+              </div>
+
+              {/* Urgency */}
+              <div style={{ padding: '6px 10px', background: 'rgba(99,102,241,0.15)', borderRadius: '6px' }}>
+                <div style={{ color: '#a5b4fc', fontSize: '0.7rem', textTransform: 'uppercase', marginBottom: '2px' }}>Urgency</div>
+                <div style={{
+                  color: semanticData.urgency_level === 'critical' ? '#ef4444'
+                    : semanticData.urgency_level === 'high' ? '#f59e0b'
+                    : semanticData.urgency_level === 'medium' ? '#3b82f6'
+                    : '#22c55e',
+                  fontWeight: 600, textTransform: 'uppercase',
+                }}>
+                  {semanticData.urgency_level}
+                </div>
+              </div>
+
+              {/* Tone */}
+              <div style={{ padding: '6px 10px', background: 'rgba(99,102,241,0.15)', borderRadius: '6px' }}>
+                <div style={{ color: '#a5b4fc', fontSize: '0.7rem', textTransform: 'uppercase', marginBottom: '2px' }}>Recommended Tone</div>
+                <div style={{ color: '#e0e7ff', fontWeight: 600 }}>{semanticData.recommended_tone}</div>
+              </div>
+
+              {/* Summary — full width */}
+              <div style={{ gridColumn: '1 / -1', padding: '6px 10px', background: 'rgba(99,102,241,0.1)', borderRadius: '6px' }}>
+                <div style={{ color: '#a5b4fc', fontSize: '0.7rem', textTransform: 'uppercase', marginBottom: '2px' }}>Summary</div>
+                <div style={{ color: '#cbd5e1' }}>{semanticData.one_line_summary}</div>
+              </div>
+
+              {/* Flags */}
+              <div style={{ gridColumn: '1 / -1', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                {semanticData.compliance_flag && (
+                  <span style={{ padding: '2px 8px', background: '#7c3aed', borderRadius: '4px', fontSize: '0.75rem', color: '#e0e7ff' }}>
+                    🔒 Compliance Flag
+                  </span>
+                )}
+                {semanticData.escalation_recommended && (
+                  <span style={{ padding: '2px 8px', background: '#ef4444', borderRadius: '4px', fontSize: '0.75rem', color: '#fff' }}>
+                    ⚠ Escalation Recommended
+                  </span>
+                )}
+              </div>
+            </div>
+          ) : (
+            <p className="rag-empty">Semantic analysis will appear here after each utterance</p>
           )}
         </div>
       </div>
 
       {/* --- Two-Column Grid: History + RAG --- */}
       <div className="panels-grid">
-
         {/* --- Conversation History Panel --- */}
-        {/*
-          WHY THIS PANEL EXISTS:
-          This is the MOST educational part of the UI. It shows you the
-          exact array that gets sent to the LLM on every turn. You can
-          literally watch the context window being built turn by turn.
-          This is how ALL LLM chat applications work — the entire conversation
-          is passed to the model every time because it has no memory.
-        */}
         <div className="panel" id="history-panel">
           <div className="panel__header">
             <span className="panel__title">Context Window</span>
@@ -799,17 +714,25 @@ export default function App() {
           <div className="panel__body" ref={historyPanelRef}>
             {conversationHistory.length === 0 ? (
               <p className="history-empty">
-                Conversation history will appear here — this is the array sent to the LLM every turn
+                Conversation history will appear here
               </p>
             ) : (
               <div className="history-list">
                 {conversationHistory.map((turn, idx) => (
                   <div className="history-turn" key={idx}>
-                    <div className={`history-turn__avatar history-turn__avatar--${turn.role === 'user' ? 'user' : 'ai'}`}>
+                    <div
+                      className={`history-turn__avatar history-turn__avatar--${
+                        turn.role === 'user' ? 'user' : 'ai'
+                      }`}
+                    >
                       {turn.role === 'user' ? 'U' : 'AI'}
                     </div>
                     <div className="history-turn__content">
-                      <div className={`history-turn__role history-turn__role--${turn.role === 'user' ? 'user' : 'ai'}`}>
+                      <div
+                        className={`history-turn__role history-turn__role--${
+                          turn.role === 'user' ? 'user' : 'ai'
+                        }`}
+                      >
                         {turn.role === 'user' ? 'User' : 'Assistant'}
                       </div>
                       <div className="history-turn__text">{turn.content}</div>
@@ -822,15 +745,6 @@ export default function App() {
         </div>
 
         {/* --- RAG Context Panel --- */}
-        {/*
-          WHY THIS PANEL EXISTS:
-          RAG is invisible by default — the user never sees what was retrieved.
-          Making it visible teaches you:
-          1. What the embedding search actually found
-          2. Whether the retrieved chunks are relevant (debugging RAG quality)
-          3. How the LLM's answer changes based on what context it receives
-          In production, this data goes to monitoring dashboards, not the user.
-        */}
         <div className="panel" id="rag-panel">
           <div className="panel__header">
             <span className="panel__title">RAG Retrieved</span>
@@ -864,12 +778,6 @@ export default function App() {
 // ICONS
 // ============================================================
 
-/**
- * WHY INLINE SVG INSTEAD OF AN ICON LIBRARY:
- * We don't need 500 icons — just one mic icon. Adding react-icons or
- * similar would bloat the bundle for no reason. Inline SVG is the lightest
- * approach and gives us full control over size and color via CSS.
- */
 function MicIcon() {
   return (
     <svg className="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -877,6 +785,15 @@ function MicIcon() {
       <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
       <line x1="12" y1="19" x2="12" y2="23" />
       <line x1="8" y1="23" x2="16" y2="23" />
+    </svg>
+  );
+}
+
+function SendIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="22" y1="2" x2="11" y2="13" />
+      <polygon points="22 2 15 22 11 13 2 9 22 2" />
     </svg>
   );
 }
