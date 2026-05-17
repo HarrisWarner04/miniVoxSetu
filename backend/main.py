@@ -1,17 +1,15 @@
 """
-miniVoxSetu — Backend Entry Point
-
-WHY THIS FILE EXISTS:
-This is the FastAPI server that bridges the browser (which handles mic/speaker)
-with the AI brain (Gemini LLM + RAG). In production voice AI systems like VoxSetu,
-the backend orchestrates STT→LLM→TTS. Here, STT and TTS happen in the browser
-(free!), so the backend only handles LLM + RAG — but the architecture mirrors
-a real system so you learn the patterns.
+miniVoxSetu — Backend Entry Point (Phase 2: Audio Forking + Semantic Layer)
+Architecture: Browser audio → asyncio.Queue fork → STT path + Acoustic path (Phase 3)
+On complete utterance: fires main pipeline AND semantic analysis concurrently.
 """
 
 import os
 import json
-from typing import List, Optional
+import asyncio
+import base64
+import time
+from typing import Optional
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -20,111 +18,217 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 
 from rag import RAGEngine
+from pii import redact_pii
+from stt import DeepgramSTT
+from tts import synthesize, detect_sentence_boundary
+from semantic import analyze_utterance
 
-# WHY: .env keeps secrets out of source code. In production you'd use
-# a secret manager (AWS Secrets Manager, GCP Secret Manager), but .env
-# is the standard for local dev.
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+
 if not GEMINI_API_KEY:
-    raise ValueError(
-        "GEMINI_API_KEY not found in .env file. "
-        "Get a free key from https://aistudio.google.com/app/apikey"
-    )
+    raise ValueError("GEMINI_API_KEY not found in .env")
+if not DEEPGRAM_API_KEY:
+    raise ValueError("DEEPGRAM_API_KEY not found in .env")
+if not ELEVENLABS_API_KEY:
+    raise ValueError("ELEVENLABS_API_KEY not found in .env")
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# WHY: We initialize the RAG engine at startup so embeddings are computed once,
-# not on every request. In production, you'd pre-compute embeddings offline
-# and load the vector DB from disk.
 rag_engine: Optional[RAGEngine] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    WHY: FastAPI's lifespan context manager lets us run setup code once
-    at startup and cleanup at shutdown. We use it to initialize the RAG
-    engine (embed FAQ documents into ChromaDB) before any requests arrive.
-    """
     global rag_engine
     rag_engine = RAGEngine(api_key=GEMINI_API_KEY)
     rag_engine.initialize()
-    print("[OK] RAG engine initialized with FAQ documents")
+    print("[OK] RAG engine initialized")
     yield
-    # Cleanup would go here if needed
 
 
-app = FastAPI(
-    title="miniVoxSetu",
-    description="Minimal Voice AI Agent for learning",
-    lifespan=lifespan,
-)
+app = FastAPI(title="miniVoxSetu", lifespan=lifespan)
 
-# WHY: CORS must be configured because the React frontend runs on a different
-# port (5173) than the backend (8000). Without CORS, the browser blocks
-# cross-origin requests — this is a security feature of browsers, not a bug.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, lock this to your frontend domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+SYSTEM_PROMPT = """You are Neha, a voice AI agent handling live phone calls for NeoBank, a modern Indian digital bank.
 
-# WHY: We define the system prompt here so it's consistent across all turns.
-# The system prompt shapes the AI's personality and behavior. In production
-# voice AI, this prompt is carefully tuned for the use case (banking, support, etc.)
-SYSTEM_PROMPT = """You are a helpful voice AI assistant for NeoBank, a fictional digital bank.
-Keep responses concise and conversational — remember, the user is LISTENING to your response,
-not reading it. Aim for 2-3 sentences max unless the user asks for detail.
-If you receive context from the knowledge base, use it to answer accurately.
-Never say "according to the knowledge base" — just answer naturally as if you know it."""
+CRITICAL — YOU ARE ON A PHONE CALL, NOT A CHATBOT:
+- You are speaking to a real person who CALLED the bank. Respond as if you are on a live phone call.
+- Start the very first response with a warm greeting: "Thank you for calling NeoBank! This is Neha, how may I help you today?"
+- Use natural conversational fillers: "Sure, let me check that for you", "I understand", "Of course", "Absolutely".
+- Show empathy when the caller is frustrated: "I completely understand how frustrating that must be. Let me help you resolve this right away."
+- Keep every response to 1-3 SHORT sentences. The caller is listening, not reading. Long responses feel robotic.
+- End responses with a follow-up: "Is there anything else I can help you with?" or "Would you like me to check anything else?"
+- Use Indian English naturally: "lakh" not "hundred thousand", "crore" not "ten million", amounts in ₹ (INR).
+
+BANKING COMPLIANCE:
+- NEVER read out full account numbers, Aadhaar numbers, or card numbers on a call. Say "the account ending in [last 4 digits]".
+- For sensitive operations (fund transfer, card block, loan closure), say "For your security, I'll need to verify your identity first."
+- If you don't know something, say "Let me connect you to a specialist for that" — never make up financial information.
+
+If you receive context from the knowledge base, use it naturally as if you already know this information.
+Never say "according to our records" or "the knowledge base says". Just answer naturally."""
 
 
 @app.get("/health")
 async def health_check():
-    """Simple health check endpoint."""
     return {"status": "ok", "rag_initialized": rag_engine is not None}
 
 
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
-    """
-    WHY WE USE WEBSOCKETS INSTEAD OF REST:
-    Voice AI needs streaming — the LLM generates tokens one by one, and we want
-    to send each chunk to the frontend immediately so TTS can start speaking
-    before the full response is ready. This reduces perceived latency dramatically.
-    REST would require waiting for the entire response before sending it back.
-    In production systems like VoxSetu, WebSockets (or gRPC streams) are standard
-    for this exact reason.
-    """
     await websocket.accept()
-    print("[WS] WebSocket client connected")
+    print("[WS] Client connected")
 
-    try:
-        while True:
-            # WHY: We receive the full conversation history from the frontend
-            # on every turn. This is how stateless LLM APIs work — the model
-            # has NO memory between calls. The conversation history array IS
-            # the model's memory. This is the "context window" concept.
-            data = await websocket.receive_text()
-            message = json.loads(data)
+    # --- Session state ---
+    conversation_history = []
+    current_pipeline_task = None
+    current_semantic_task = None
+    is_speaking = False
 
-            user_text = message.get("text", "")
-            conversation_history = message.get("history", [])
+    # --- Semantic layer state ---
+    # One-turn-behind buffer: semantic result from previous turn,
+    # injected into next turn's system prompt
+    latest_semantic_context = None
+    # Accumulator for post-call report
+    turn_log = []
+    turn_counter = 0
 
-            if not user_text.strip():
-                continue
+    # --- Audio forking queues ---
+    # In production, FreeSWITCH duplicates RTP into two WebSocket streams.
+    # Here, we duplicate the browser audio into two asyncio queues.
+    stt_queue = asyncio.Queue()
+    acoustic_queue = asyncio.Queue()  # Consumer added in Phase 3
 
-            # --- RAG RETRIEVAL STEP ---
-            # WHY: The LLM doesn't know anything about NeoBank (our fictional bank).
-            # RAG (Retrieval-Augmented Generation) fixes this: before every LLM call,
-            # we search our FAQ vector database for relevant information and inject
-            # it into the prompt. This is how production AI agents know domain-specific
-            # information without fine-tuning the model.
+    # --- Deepgram STT setup ---
+    stt = DeepgramSTT(api_key=DEEPGRAM_API_KEY)
+
+    # --- STT Queue Consumer ---
+    async def stt_consumer():
+        """Pull audio from stt_queue and forward to Deepgram."""
+        try:
+            while True:
+                audio_bytes = await stt_queue.get()
+                await stt.send(audio_bytes)
+        except asyncio.CancelledError:
+            pass
+
+    # --- Acoustic Queue Drain (placeholder for Phase 3) ---
+    async def acoustic_drain():
+        """Drain acoustic queue to prevent memory buildup. Phase 3 replaces this."""
+        try:
+            while True:
+                await acoustic_queue.get()
+                # Phase 3: resample → librosa features → buffer → WavLM inference
+        except asyncio.CancelledError:
+            pass
+
+    # --- Transcript callback ---
+    async def on_transcript(text: str, is_final: bool):
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "transcript",
+                "text": text,
+                "is_final": is_final,
+            }))
+        except Exception:
+            pass
+
+    # --- Utterance end: fire BOTH main pipeline and semantic analysis ---
+    async def on_utterance_end(full_text: str):
+        nonlocal current_pipeline_task, current_semantic_task, is_speaking, turn_counter
+        if is_speaking:
+            return
+
+        print(f"[STT] Utterance: {full_text}")
+        turn_counter += 1
+
+        # Fire main pipeline
+        current_pipeline_task = asyncio.create_task(
+            run_pipeline(full_text, turn_counter)
+        )
+
+        # Fire semantic analysis concurrently (does NOT block main pipeline)
+        conversation_summary = " | ".join(
+            f"{t['role']}: {t['content'][:80]}" for t in conversation_history[-6:]
+        )
+        current_semantic_task = asyncio.create_task(
+            run_semantic_analysis(full_text, turn_counter, conversation_summary)
+        )
+
+    # --- Semantic Analysis (runs parallel to main pipeline) ---
+    async def run_semantic_analysis(user_text: str, turn_id: int, conv_summary: str):
+        nonlocal latest_semantic_context
+        try:
+            print(f"[SEMANTIC] Analyzing turn {turn_id}...")
+            start_time = time.time()
+
+            # PII redact before sending to LLM
+            redacted_text, _ = redact_pii(user_text)
+
+            result = await analyze_utterance(
+                redacted_text, GEMINI_API_KEY, conv_summary
+            )
+
+            elapsed = round((time.time() - start_time) * 1000)
+            print(f"[SEMANTIC] Turn {turn_id} done in {elapsed}ms: {result.get('intent', '?')}")
+
+            # Store for next turn's context injection
+            latest_semantic_context = result
+
+            # Append to turn log for post-call report
+            turn_log.append({
+                "turn_id": turn_id,
+                "utterance": redacted_text,
+                "semantic": result,
+                "interrupted": False,
+                "timestamp": time.time(),
+            })
+
+            # Push to frontend dashboard panel
+            await websocket.send_text(json.dumps({
+                "type": "semantic",
+                "data": result,
+                "turn_id": turn_id,
+                "latency_ms": elapsed,
+            }))
+
+        except asyncio.CancelledError:
+            # Barge-in: tag as interrupted if we had partial results
+            print(f"[SEMANTIC] Turn {turn_id} cancelled (barge-in)")
+            turn_log.append({
+                "turn_id": turn_id,
+                "utterance": user_text[:100],
+                "semantic": None,
+                "interrupted": True,
+                "timestamp": time.time(),
+            })
+        except Exception as e:
+            print(f"[SEMANTIC] Error: {e}")
+
+    # --- Main Voice Pipeline ---
+    async def run_pipeline(user_text: str, turn_id: int):
+        nonlocal is_speaking
+
+        try:
+            await websocket.send_text(json.dumps({"type": "state", "state": "THINKING"}))
+
+            # Step 1: PII Redaction
+            user_text, pii_findings = redact_pii(user_text)
+            if pii_findings:
+                print(f"[PII] Redacted: {pii_findings}")
+
+            # Step 2: RAG Retrieval
             rag_context = ""
             rag_chunks = []
             if rag_engine:
@@ -132,94 +236,199 @@ async def websocket_chat(websocket: WebSocket):
                 if results:
                     rag_chunks = results
                     rag_context = "\n\n---\nRelevant knowledge base context:\n"
-                    rag_context += "\n".join(f"- {chunk}" for chunk in results)
+                    rag_context += "\n".join(f"- {c}" for c in results)
                     rag_context += "\n---\n"
 
-            # WHY: We send the RAG chunks back to the frontend so the user can SEE
-            # what was retrieved. This transparency is crucial for debugging RAG
-            # systems — in production, you'd log this for quality monitoring.
             await websocket.send_text(json.dumps({
                 "type": "rag_context",
                 "chunks": rag_chunks,
                 "query": user_text,
             }))
 
-            # --- BUILD THE PROMPT WITH FULL CONVERSATION HISTORY ---
-            # WHY: We pass the FULL conversation history every single call because
-            # Gemini (like all LLM APIs) has no memory between API calls — the
-            # context window is our memory. Each element in this array is a turn.
-            # In production, you'd also manage context window limits (truncating
-            # old turns when approaching the token limit).
+            # Step 3: Build system prompt with semantic context injection
+            enhanced_prompt = SYSTEM_PROMPT + rag_context
+
+            if latest_semantic_context:
+                sem = latest_semantic_context
+                enhanced_prompt += (
+                    "\n\n---\nSEMANTIC INTELLIGENCE FROM PREVIOUS TURN:\n"
+                    f"- Customer intent: {sem.get('intent', 'unknown')}\n"
+                    f"- Sentiment: {sem.get('sentiment', 0)}\n"
+                    f"- Urgency: {sem.get('urgency_level', 'low')}\n"
+                    f"- Escalation needed: {sem.get('escalation_recommended', False)}\n"
+                    f"- Summary: {sem.get('one_line_summary', '')}\n"
+                    f"- Recommended tone: {sem.get('recommended_tone', 'professional')}\n"
+                    "Use this context to adapt your response tone and approach.\n---\n"
+                )
+
+            # Step 4: Gemini with conversation history
             gemini_history = []
             for turn in conversation_history:
                 role = "user" if turn["role"] == "user" else "model"
-                gemini_history.append({
-                    "role": role,
-                    "parts": [turn["content"]]
-                })
+                gemini_history.append({"role": role, "parts": [turn["content"]]})
 
-            # WHY: We create a new model instance per request. This is stateless
-            # by design — the model doesn't remember previous conversations.
-            # The system instruction sets the AI's persona and behavior.
             model = genai.GenerativeModel(
                 "gemini-2.5-flash",
-                system_instruction=SYSTEM_PROMPT + rag_context,
+                system_instruction=enhanced_prompt,
             )
-
-            # WHY: We start a chat with the history so Gemini sees the full
-            # conversation context. Then we send the latest user message.
             chat = model.start_chat(history=gemini_history)
 
-            # --- STREAMING RESPONSE ---
-            # WHY: Streaming sends tokens as they're generated instead of waiting
-            # for the complete response. This is CRITICAL for voice AI because:
-            # 1. TTS can start speaking the first sentence while the rest generates
-            # 2. Perceived latency drops from seconds to milliseconds
-            # 3. The user feels like the AI is "thinking and speaking" naturally
-            # In production, this is called "incremental TTS" or "streaming synthesis"
+            # Step 5: Stream LLM response with cascaded TTS
+            is_speaking = True
+            await websocket.send_text(json.dumps({"type": "state", "state": "SPEAKING"}))
+
             full_response = ""
-            try:
-                # WHY: We use send_message_async (not send_message) because this
-                # is an async handler. The sync version BLOCKS the entire event
-                # loop during each network round-trip to Gemini, preventing the
-                # server from handling ANY other WebSocket connections. Always
-                # use async I/O inside async functions.
-                response = await chat.send_message_async(user_text, stream=True)
+            text_buffer = ""
 
-                async for chunk in response:
-                    if chunk.text:
-                        full_response += chunk.text
-                        # WHY: Each chunk is sent immediately via WebSocket.
-                        # The frontend accumulates these chunks and can start
-                        # TTS on complete sentences while more text arrives.
-                        await websocket.send_text(json.dumps({
-                            "type": "chunk",
-                            "text": chunk.text,
-                        }))
+            response = await chat.send_message_async(user_text, stream=True)
 
-                # WHY: We send a "done" message so the frontend knows the full
-                # response is complete. This is important for updating the
-                # conversation history with the complete assistant turn.
-                await websocket.send_text(json.dumps({
-                    "type": "done",
-                    "full_text": full_response,
-                }))
+            async for chunk in response:
+                if not is_speaking:
+                    break
 
-            except Exception as e:
-                print(f"[ERROR] Gemini API error: {e}")
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "message": str(e),
-                }))
+                if chunk.text:
+                    full_response += chunk.text
+                    text_buffer += chunk.text
+
+                    await websocket.send_text(json.dumps({
+                        "type": "chunk",
+                        "text": chunk.text,
+                    }))
+
+                    sentence, remaining = detect_sentence_boundary(text_buffer)
+                    if sentence:
+                        text_buffer = remaining
+                        try:
+                            audio_bytes = await synthesize(sentence, ELEVENLABS_API_KEY)
+                            audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+                            await websocket.send_text(json.dumps({
+                                "type": "audio",
+                                "data": audio_b64,
+                                "format": "mp3",
+                            }))
+                        except Exception as e:
+                            print(f"[TTS] Error: {e}")
+
+            # TTS remaining buffer
+            if text_buffer.strip() and is_speaking:
+                try:
+                    audio_bytes = await synthesize(text_buffer.strip(), ELEVENLABS_API_KEY)
+                    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+                    await websocket.send_text(json.dumps({
+                        "type": "audio",
+                        "data": audio_b64,
+                        "format": "mp3",
+                    }))
+                except Exception as e:
+                    print(f"[TTS] Error on final chunk: {e}")
+
+            # Update conversation history
+            conversation_history.append({"role": "user", "content": user_text})
+            conversation_history.append({"role": "assistant", "content": full_response})
+
+            await websocket.send_text(json.dumps({
+                "type": "done",
+                "full_text": full_response,
+            }))
+
+            is_speaking = False
+            await websocket.send_text(json.dumps({"type": "state", "state": "LISTENING"}))
+
+        except asyncio.CancelledError:
+            is_speaking = False
+        except Exception as e:
+            print(f"[PIPELINE] Error: {e}")
+            is_speaking = False
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": str(e),
+            }))
+
+    # --- Connect Deepgram + Start forking consumers ---
+    try:
+        await stt.connect(on_transcript, on_utterance_end)
+        print("[STT] Deepgram connected")
+    except Exception as e:
+        print(f"[STT] Failed to connect: {e}")
+        await websocket.send_text(json.dumps({
+            "type": "error",
+            "message": f"Deepgram connection failed: {e}",
+        }))
+        await websocket.close()
+        return
+
+    # Start forking queue consumers
+    stt_task = asyncio.create_task(stt_consumer())
+    acoustic_task = asyncio.create_task(acoustic_drain())
+
+    # --- Main receive loop ---
+    try:
+        while True:
+            message = await websocket.receive()
+
+            if message["type"] == "websocket.disconnect":
+                break
+
+            # Binary frame = audio from browser mic → FORK to both queues
+            if "bytes" in message:
+                audio = message["bytes"]
+                stt_queue.put_nowait(audio)
+                acoustic_queue.put_nowait(audio)
+
+            # Text frame = control message
+            elif "text" in message:
+                data = json.loads(message["text"])
+                msg_type = data.get("type", "")
+
+                if msg_type == "barge_in":
+                    print("[BARGE-IN] User interrupted")
+                    is_speaking = False
+                    stt.flush()
+                    # Cancel main pipeline
+                    if current_pipeline_task and not current_pipeline_task.done():
+                        current_pipeline_task.cancel()
+                    # Cancel semantic analysis (incomplete analysis is worthless)
+                    if current_semantic_task and not current_semantic_task.done():
+                        current_semantic_task.cancel()
+
+                elif msg_type == "text_input":
+                    text = data.get("text", "")
+                    history = data.get("history", [])
+                    conversation_history = [
+                        {"role": h["role"], "content": h["content"]}
+                        for h in history
+                    ]
+                    if text.strip():
+                        turn_counter += 1
+                        current_pipeline_task = asyncio.create_task(
+                            run_pipeline(text, turn_counter)
+                        )
+                        # Also run semantic on text input
+                        current_semantic_task = asyncio.create_task(
+                            run_semantic_analysis(text, turn_counter, "")
+                        )
 
     except WebSocketDisconnect:
-        print("[WS] WebSocket client disconnected")
+        print("[WS] Client disconnected")
     except Exception as e:
-        print(f"[ERROR] Unexpected error: {e}")
+        print(f"[WS] Error: {e}")
+    finally:
+        # Cleanup
+        stt_task.cancel()
+        acoustic_task.cancel()
+        await stt.close()
+        if current_pipeline_task and not current_pipeline_task.done():
+            current_pipeline_task.cancel()
+        if current_semantic_task and not current_semantic_task.done():
+            current_semantic_task.cancel()
+
+        # Log turn summary for debugging
+        if turn_log:
+            print(f"[SESSION] {len(turn_log)} turns logged for post-call report")
+
+        print("[WS] Session cleaned up")
 
 
 if __name__ == "__main__":
     import uvicorn
-    # WHY: We run on 0.0.0.0 so the server is accessible from any network
-    # interface (not just localhost). Port 8000 is the FastAPI convention.
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
