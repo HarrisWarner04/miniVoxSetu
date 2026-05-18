@@ -12,3 +12,8 @@ numpy==2.2.5
 
 # HTTP client (ElevenLabs TTS API)
 httpx==0.28.1
+
+# Phase 3: Acoustic Intelligence
+librosa==0.10.2.post1
+transformers==4.49.0
+soundfile==0.13.1

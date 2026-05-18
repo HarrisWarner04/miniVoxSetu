@@ -1,86 +1,79 @@
-# miniVoxSetu — Learn Voice AI by Building One
+# miniVoxSetu — Production Voice AI Pipeline MVP
 
-A minimal, fully-commented voice AI agent that teaches you how production systems like VoxSetu work. Every meaningful block of code has a **WHY** comment explaining the architectural reason it exists.
+A fully-featured, production-grade Voice AI agent that demonstrates enterprise voice architectures (like FreeSWITCH forking, multi-modal intelligence, and rapid barge-in) using a React + FastAPI stack.
 
-## What This Project Does
-
-You speak into your microphone → the browser converts your speech to text → the text is sent to a Gemini LLM (with domain knowledge injected via RAG) → the LLM's response is streamed back → the browser speaks it aloud. You can **interrupt the AI mid-sentence** (barge-in), and the system resets instantly.
+This project upgraded from a simple browser-based bot to a full Server-Driven Intelligence pipeline.
 
 ---
 
-## Architecture
+## Architecture Overview
 
 ```
-Browser (Free APIs)                 Backend (Python)
-┌──────────────────┐               ┌──────────────────────┐
-│  getUserMedia     │── audio ────▶│                      │
-│  (WebRTC)         │              │     FastAPI           │
-├──────────────────┤              │     WebSocket         │
-│  Web Speech API   │              │                      │
-│  (STT)            │── text ────▶│  ┌────────────────┐  │
-├──────────────────┤              │  │  RAG Engine     │  │
-│                   │              │  │  (NumPy Vector  │  │
-│                   │◀─ streaming ─│  │   Store +       │  │
-│                   │   chunks     │  │   Gemini        │  │
-├──────────────────┤              │  │   Embeddings)   │  │
-│  Web Speech       │              │  └────────────────┘  │
-│  Synthesis (TTS)  │◀─ complete ─│                      │
-│                   │   response  │  ┌────────────────┐  │
-├──────────────────┤              │  │  Gemini 2.0     │  │
-│  VAD (Audio       │              │  │  Flash LLM      │  │
-│  Energy Detection)│── barge-in ▶│  │  (Async         │  │
-└──────────────────┘              │  │   Streaming)    │  │
-                                   │  └────────────────┘  │
-                                   └──────────────────────┘
+Browser (Audio Source)              Backend (FastAPI)
+┌──────────────────┐               ┌─────────────────────────────────┐
+│                  │── PCM ───────▶│  Acoustic Layer (HuBERT)        │
+│  getUserMedia    │               │  extracts Pitch, Emotion, Stress│
+│  (AudioWorklet)  │── WebM ──────▶│  STT Layer (Deepgram)           │
+│                  │               │                                 │
+├──────────────────┤               ├─────────────────────────────────┤
+│  VAD Energy      │── barge-in ─▶ │  Main Pipeline:                 │
+│  Detection       │               │   1. PII Redaction              │
+│                  │               │   2. RAG Context Injection      │
+├──────────────────┤               │   3. Gemini LLM Streaming       │
+│                  │               │   4. Sentence Boundary Detection│
+│  Live Dashboard  │◀─ JSON ───────│   5. ElevenLabs TTS             │
+│  (React)         │               │                                 │
+├──────────────────┤               ├─────────────────────────────────┤
+│                  │               │  Semantic Layer (Parallel):     │
+│  Audio Playback  │◀─ MP3 ────────│   Analyzes Intent, Sentiment,   │
+│                  │               │   Urgency, Compliance Flags.    │
+└──────────────────┘               └─────────────────────────────────┘
 ```
 
-### What Lives Where and Why
+---
 
-| Component | Location | Why There |
-|-----------|----------|-----------|
-| **STT** | Browser | Web Speech API is free, runs locally, zero network latency |
-| **TTS** | Browser | Speech Synthesis is free, instant cancel enables barge-in |
-| **VAD** | Browser | Audio energy analysis must be real-time, can't afford network round-trip |
-| **LLM** | Backend | Gemini API key must stay server-side (security) |
-| **RAG** | Backend | Embeddings + vector search happen near the LLM for efficiency |
-| **WebSocket** | Both | Enables streaming — tokens flow as they're generated, not all at once |
+## The Intelligence Layers
+
+This MVP implements three core layers of intelligence:
+
+1. **Main Generative Pipeline (`main.py`)**: Handles the core conversational loop. Audio is transcribed via Deepgram, scrubbed of PII, enriched with RAG knowledge, and streamed to Gemini. Responses are converted to voice via ElevenLabs.
+2. **Semantic Layer (`semantic.py`)**: Runs in parallel to the main pipeline. It analyzes the user's utterance for intent and sentiment, and feeds this data back into the LLM context for the *next* turn, allowing the agent to adapt its tone.
+3. **Acoustic Layer (`acoustic.py`)**: A dual-path audio processor running on a separate thread. It extracts physical audio features (Pitch, Volume) via `librosa` and ML emotion features via `DistilHuBERT`.
+
+These layers fuse their outputs into a **Combined Risk Signal** and generate an automated Post-Call QA Report when the session ends.
 
 ---
 
-## 7 Core Concepts Taught
+## Edge Cases & Enterprise Features Handled
 
-| # | Concept | Where in Code | Why It Matters |
-|---|---------|---------------|----------------|
-| 1 | **WebRTC Mic Capture** | `App.jsx` → `startVAD()` | How browsers access the microphone via `getUserMedia` |
-| 2 | **Speech-to-Text** | `App.jsx` → `useSpeechRecognition` | Real-time voice-to-text with interim results |
-| 3 | **LLM Streaming** | `main.py` → `websocket_chat()` | Async token-by-token response for low perceived latency |
-| 4 | **Text-to-Speech** | `App.jsx` → `useSpeechSynthesis` | Making the AI speak aloud with preloaded voice selection |
-| 5 | **Barge-in** | `App.jsx` → `handleBargeIn()` | Interrupting AI mid-sentence (< 200ms) |
-| 6 | **Context Window** | `App.jsx` → `conversationHistory` | Full history sent every LLM call (stateless API) |
-| 7 | **RAG** | `rag.py` → `RAGEngine` | Injecting domain knowledge into LLM prompts via vector search |
+| Feature | How It's Handled |
+|---------|-----------------|
+| **Barge-in / Interruption** | Browser VAD detects speech, stops TTS audio playback immediately, and sends a WebSocket signal that cancels all in-flight Python `asyncio` tasks. |
+| **Audio Forking** | Emulating FreeSWITCH, the browser sends raw PCM via AudioWorklet and encoded WebM via MediaRecorder, effectively "forking" the stream to STT and Acoustic models simultaneously. |
+| **Non-blocking ML** | The heavy HuBERT acoustic model runs in a `ThreadPoolExecutor` so it never blocks the FastAPI WebSocket loop. |
+| **Safety Fallbacks** | If PyTorch/CUDA are unavailable during a demo, the acoustic layer gracefully falls back to a realistic "Simulation Mode" without crashing. |
 
 ---
 
-## Setup
+## Setup & Running
 
-### 1. Get a Free Gemini API Key
-
-Go to [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey) and create a free API key.
+### 1. Environment Variables
+Create a `.env` file in the `backend/` directory with your API keys:
+```
+GEMINI_API_KEY=your_key_here
+DEEPGRAM_API_KEY=your_key_here
+ELEVENLABS_API_KEY=your_key_here
+```
 
 ### 2. Backend
-
 ```bash
 cd backend
 pip install -r requirements.txt
-
-# Create .env file with your API key
-# Edit .env and paste your Gemini API key
-
 python main.py
 ```
+*(Note: On first run, the HuBERT model weights will be downloaded. If `torch` or `librosa` fails to install on Windows, the app will auto-fallback to simulation mode.)*
 
 ### 3. Frontend
-
 ```bash
 cd frontend
 npm install
@@ -88,99 +81,4 @@ npm run dev
 ```
 
 ### 4. Open in Browser
-
-Go to [http://localhost:5173](http://localhost:5173) in **Chrome** (best Web Speech API support).
-
-Click the mic button and start talking!
-
----
-
-## File Structure
-
-```
-miniVoxSetu/
-├── backend/
-│   ├── main.py              # FastAPI server — WebSocket, Gemini async streaming, RAG injection
-│   ├── rag.py               # RAG engine — Gemini embeddings + NumPy cosine similarity vector store
-│   ├── requirements.txt     # Python dependencies
-│   ├── .env.example         # Template for API key
-│   └── .env                 # Your actual API key (git-ignored)
-├── frontend/
-│   ├── src/
-│   │   ├── App.jsx          # Entire voice pipeline in one file (883 lines, heavily commented)
-│   │   ├── index.css        # Dark-theme design system with CSS custom properties
-│   │   └── main.jsx         # React entry point
-│   ├── index.html           # HTML entry with Google Fonts (Inter + JetBrains Mono)
-│   ├── package.json         # NPM dependencies (React 19 + Vite 6)
-│   └── vite.config.js       # Vite config with WebSocket proxy to backend
-├── WALKTHROUGH.md           # Detailed architectural walkthrough (read this!)
-└── README.md                # This file
-```
-
----
-
-## Tech Stack (All Free)
-
-| Component | Technology | Cost |
-|-----------|-----------|------|
-| STT | Browser Web Speech API | Free |
-| LLM | Google Gemini 2.0 Flash (async streaming) | Free tier |
-| TTS | Browser Web Speech Synthesis (with voice preloading) | Free |
-| Embeddings | Gemini `text-embedding-004` (768-dim) | Free tier |
-| Vector DB | NumPy cosine similarity (mirrors ChromaDB interface) | Free |
-| VAD | Audio energy detection with duplicate-prevention guards | Free |
-| Transport | WebSocket (protocol-aware URL via Vite proxy) | Free |
-| Backend | Python FastAPI (fully async) | Free |
-| Frontend | React 19 + Vite 6 | Free |
-
----
-
-## Edge Cases Handled
-
-The codebase handles these edge cases that are commonly missed in voice AI projects:
-
-| Edge Case | How It's Handled |
-|-----------|-----------------|
-| **Rapid mic clicks** | AudioContext creation is guarded — won't create duplicates |
-| **Multiple barge-in intervals** | Previous interval is cleared before creating a new one |
-| **WebSocket disconnect mid-conversation** | Safety `useEffect` resets state machine to IDLE |
-| **TTS voices not loaded yet** | Voices are preloaded via `voiceschanged` event listener |
-| **Server blocking during LLM streaming** | Uses `send_message_async` + `async for` (non-blocking) |
-| **Component unmount** | VAD resources (MediaStream, AudioContext, intervals) are cleaned up |
-| **Speech recognition errors** | `no-speech` and `aborted` are silently ignored (they're normal) |
-| **Recognition already running** | `start()` is wrapped in try-catch to handle rapid state transitions |
-
----
-
-## How It Works (Read the Code!)
-
-Every meaningful block of code has a `WHY` comment explaining the architectural reason it exists. Start reading from:
-
-1. **`App.jsx`** — Follow the voice pipeline: mic → STT → LLM → TTS
-2. **`main.py`** — See how WebSocket streaming and RAG injection work
-3. **`rag.py`** — Understand embedding, indexing, and cosine similarity retrieval
-
-For a **comprehensive architectural walkthrough**, read [`WALKTHROUGH.md`](WALKTHROUGH.md).
-
----
-
-## What Production Systems Do Differently
-
-| This Project | Production (VoxSetu-class) |
-|-------------|--------------------------|
-| Web Speech API (browser STT) | Cloud STT (Deepgram/Google) — higher accuracy |
-| Speech Synthesis (browser TTS) | Cloud TTS (ElevenLabs) — natural voices, SSML |
-| Audio energy threshold for VAD | ML-based VAD (Silero) — better noise rejection |
-| Full history every call | Token counting + truncation at context limit |
-| In-memory NumPy vector store | Persistent vector DB (Pinecone/pgvector) with millions of docs |
-| Single WebSocket | gRPC streams with connection pooling |
-| No auth | JWT tokens, API keys, rate limiting |
-| Hardcoded FAQ (8 documents) | Document ingestion pipeline, chunking strategies, metadata filters |
-
-> **Despite these differences, the architectural patterns are identical.** The pipeline flow (STT → RAG → LLM → TTS), the state machine, the streaming approach, the conversation history management, and the barge-in mechanism are the same in this learning project and in production systems. That's the whole point.
-
----
-
-## License
-
-MIT — Learn, modify, build on top of it.
+Go to [http://localhost:5173](http://localhost:5173). Click the mic button to start the session.

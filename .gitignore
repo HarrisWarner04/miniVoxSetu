@@ -6,3 +6,8 @@ dist/
 .vite/
 Documentation/
 *.resolved
+
+# Backend ignores
+.venv/
+.pipcache/
+backend/reports/

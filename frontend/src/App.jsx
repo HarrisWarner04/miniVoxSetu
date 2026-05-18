@@ -127,14 +127,23 @@ export default function App() {
   const [semanticData, setSemanticData] = useState(null);
   const [semanticLatency, setSemanticLatency] = useState(0);
 
+  // --- Acoustic intelligence ---
+  const [acousticData, setAcousticData] = useState(null);
+  const [acousticLatency, setAcousticLatency] = useState(0);
+
   // --- Text input fallback ---
   const [textInput, setTextInput] = useState('');
 
   // --- Error ---
   const [sttError, setSttError] = useState('');
 
+  // --- Post-call report ---
+  const [reportData, setReportData] = useState(null);
+  const [reportLoading, setReportLoading] = useState(false);
+
   // --- Audio recording ---
   const mediaRecorderRef = useRef(null);
+  const audioWorkletNodeRef = useRef(null);
   const mediaStreamRef = useRef(null);
   const isRecordingRef = useRef(false);
 
@@ -182,7 +191,7 @@ export default function App() {
       mediaStreamRef.current = stream;
 
       // Set up AnalyserNode for VAD energy detection (barge-in)
-      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
       audioContextRef.current = audioCtx;
       const source = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
@@ -190,19 +199,49 @@ export default function App() {
       source.connect(analyser);
       analyserRef.current = analyser;
 
-      // MediaRecorder sends audio chunks to backend
-      const recorder = new MediaRecorder(stream, {
-        mimeType: 'audio/webm;codecs=opus',
-      });
+      // Set up AudioWorklet for BOTH STT (linear16) and Acoustic (Float32) paths
+      try {
+        await audioCtx.audioWorklet.addModule('/pcm-processor.js');
+        const pcmNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
+        
+        pcmNode.port.onmessage = (event) => {
+          if (!isRecordingRef.current) return;
 
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0 && isRecordingRef.current) {
-          sendBinary(e.data);
-        }
-      };
+          if (event.data.type === 'stt_chunk') {
+            // STT path: Int16 PCM binary → sent as binary WebSocket frame → Deepgram
+            const int16Buffer = event.data.samples; // ArrayBuffer of Int16
+            sendBinary(int16Buffer);
+          }
 
-      recorder.start(250); // 250ms chunks
-      mediaRecorderRef.current = recorder;
+          else if (event.data.type === 'pcm_chunk') {
+            // Acoustic path: Float32 PCM → base64 JSON → HuBERT analysis
+            const { samples, sampleRate } = event.data;
+            const pcmBytes = new Uint8Array(samples.buffer);
+            let binary = '';
+            const len = pcmBytes.byteLength;
+            for (let i = 0; i < len; i++) {
+              binary += String.fromCharCode(pcmBytes[i]);
+            }
+            const base64 = btoa(binary);
+            
+            sendJSON({
+              type: 'acoustic_pcm',
+              data: base64,
+              sample_rate: sampleRate
+            });
+          }
+        };
+
+        source.connect(pcmNode);
+        pcmNode.connect(audioCtx.destination);
+        audioWorkletNodeRef.current = pcmNode;
+      } catch (workletErr) {
+        console.warn('AudioWorklet loading failed, falling back:', workletErr);
+      }
+
+      // NOTE: MediaRecorder removed — STT now uses raw PCM (linear16) from AudioWorklet
+      // This avoids the WebM container parsing issue with Deepgram streaming API.
+
       isRecordingRef.current = true;
 
       // Start barge-in energy monitoring
@@ -214,13 +253,23 @@ export default function App() {
       console.error('Mic access failed:', err);
       setSttError('Microphone access denied. Please allow mic access.');
     }
-  }, [sendBinary]);
+  }, [sendBinary, sendJSON]);
 
   const stopRecording = useCallback(() => {
+    const wasRecording = isRecordingRef.current;
     isRecordingRef.current = false;
 
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
+    // Request post-call report from backend ONLY if we were actually in a call
+    if (wasRecording) {
+      sendJSON({ type: 'end_call' });
+      setReportLoading(true);
+    }
+
+    if (audioWorkletNodeRef.current) {
+      try {
+        audioWorkletNodeRef.current.disconnect();
+      } catch (e) {}
+      audioWorkletNodeRef.current = null;
     }
 
     if (mediaStreamRef.current) {
@@ -234,7 +283,7 @@ export default function App() {
     }
 
     setAgentState(STATES.IDLE);
-  }, []);
+  }, [sendJSON]);
 
   // ============================================================
   // BARGE-IN DETECTION (energy threshold on AnalyserNode)
@@ -415,6 +464,18 @@ export default function App() {
           setSemanticLatency(message.latency_ms || 0);
           break;
 
+        case 'acoustic':
+          // Acoustic intelligence from dual-path engine
+          setAcousticData(message.data);
+          setAcousticLatency(message.latency_ms || 0);
+          break;
+
+        case 'report':
+          // Post-call report from backend
+          setReportData(message.data);
+          setReportLoading(false);
+          break;
+
         case 'error':
           console.error('Server error:', message.message);
           setSttError(message.message);
@@ -461,6 +522,19 @@ export default function App() {
     (e) => {
       e.preventDefault();
       if (!textInput.trim() || !isConnected) return;
+
+      // --- Barge-in: flush TTS if agent is speaking ---
+      if (agentStateRef.current === STATES.SPEAKING) {
+        // Stop current audio playback
+        if (currentAudioSourceRef.current) {
+          try { currentAudioSourceRef.current.stop(); } catch (_) {}
+          currentAudioSourceRef.current = null;
+        }
+        audioQueueRef.current = [];
+        isPlayingRef.current = false;
+        // Tell backend to cancel old pipeline
+        sendJSON({ type: 'barge_in' });
+      }
 
       sendJSON({
         type: 'text_input',
@@ -703,6 +777,110 @@ export default function App() {
         </div>
       </div>
 
+      {/* --- Acoustic Intelligence Panel --- */}
+      <div className="panel" id="acoustic-panel" style={{ borderLeft: acousticData?.stress_score > 0.6 ? '3px solid #ef4444' : '3px solid #22c55e' }}>
+        <div className="panel__header">
+          <span className="panel__title">Acoustic Intelligence</span>
+          <span className="panel__badge">
+            {acousticLatency > 0 ? `${acousticLatency}ms` : 'waiting'}
+          </span>
+        </div>
+        <div className="panel__body">
+          {acousticData ? (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', fontSize: '0.85rem' }}>
+              {/* Emotion */}
+              <div style={{ padding: '6px 10px', background: 'rgba(34,197,94,0.12)', borderRadius: '6px' }}>
+                <div style={{ color: '#86efac', fontSize: '0.7rem', textTransform: 'uppercase', marginBottom: '2px' }}>Emotion</div>
+                <div style={{
+                  color: acousticData.emotion === 'angry' ? '#ef4444'
+                    : acousticData.emotion === 'sad' ? '#3b82f6'
+                    : acousticData.emotion === 'happy' ? '#22c55e'
+                    : '#94a3b8',
+                  fontWeight: 700, fontSize: '1rem', textTransform: 'uppercase'
+                }}>
+                  {acousticData.emotion}
+                  <span style={{ fontSize: '0.75rem', fontWeight: 400, marginLeft: '6px', opacity: 0.8 }}>
+                    {(acousticData.emotion_confidence * 100).toFixed(0)}%
+                  </span>
+                </div>
+              </div>
+
+              {/* Stress Score */}
+              <div style={{ padding: '6px 10px', background: 'rgba(34,197,94,0.12)', borderRadius: '6px' }}>
+                <div style={{ color: '#86efac', fontSize: '0.7rem', textTransform: 'uppercase', marginBottom: '4px' }}>Stress Score</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <div style={{ flex: 1, height: '8px', background: '#1e293b', borderRadius: '4px', overflow: 'hidden' }}>
+                    <div style={{
+                      width: `${(acousticData.stress_score || 0) * 100}%`,
+                      height: '100%',
+                      borderRadius: '4px',
+                      background: acousticData.stress_score > 0.6 ? '#ef4444'
+                        : acousticData.stress_score > 0.3 ? '#f59e0b' : '#22c55e',
+                      transition: 'width 0.3s ease',
+                    }} />
+                  </div>
+                  <span style={{
+                    color: acousticData.stress_score > 0.6 ? '#ef4444'
+                      : acousticData.stress_score > 0.3 ? '#f59e0b' : '#22c55e',
+                    fontWeight: 600, minWidth: '36px'
+                  }}>
+                    {(acousticData.stress_score * 100).toFixed(0)}%
+                  </span>
+                </div>
+              </div>
+
+              {/* Pitch */}
+              <div style={{ padding: '6px 10px', background: 'rgba(34,197,94,0.12)', borderRadius: '6px' }}>
+                <div style={{ color: '#86efac', fontSize: '0.7rem', textTransform: 'uppercase', marginBottom: '2px' }}>Pitch (F0)</div>
+                <div style={{ color: '#e0e7ff', fontWeight: 600 }}>
+                  {acousticData.pitch_hz > 0 ? `${acousticData.pitch_hz.toFixed(0)} Hz` : '—'}
+                  <span style={{ fontSize: '0.7rem', marginLeft: '6px', color: '#94a3b8' }}>
+                    {acousticData.pitch_hz > 250 ? '↑ elevated' : acousticData.pitch_hz > 0 ? '→ normal' : ''}
+                  </span>
+                </div>
+              </div>
+
+              {/* Volume */}
+              <div style={{ padding: '6px 10px', background: 'rgba(34,197,94,0.12)', borderRadius: '6px' }}>
+                <div style={{ color: '#86efac', fontSize: '0.7rem', textTransform: 'uppercase', marginBottom: '4px' }}>Volume</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <div style={{ flex: 1, height: '6px', background: '#1e293b', borderRadius: '3px', overflow: 'hidden' }}>
+                    <div style={{
+                      width: `${Math.min(100, Math.max(0, ((acousticData.rms_db || -60) + 60) / 60 * 100))}%`,
+                      height: '100%',
+                      borderRadius: '3px',
+                      background: '#3b82f6',
+                      transition: 'width 0.3s ease',
+                    }} />
+                  </div>
+                  <span style={{ color: '#94a3b8', fontSize: '0.8rem', minWidth: '48px' }}>
+                    {acousticData.rms_db?.toFixed(1)} dB
+                  </span>
+                </div>
+              </div>
+
+              {/* Speech + Interrupted flags */}
+              <div style={{ gridColumn: '1 / -1', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                <span style={{
+                  padding: '2px 8px', borderRadius: '4px', fontSize: '0.75rem',
+                  background: acousticData.is_speech ? '#166534' : '#1e293b',
+                  color: acousticData.is_speech ? '#86efac' : '#64748b',
+                }}>
+                  {acousticData.is_speech ? '● Speech' : '○ Silence'}
+                </span>
+                {acousticData.interrupted && (
+                  <span style={{ padding: '2px 8px', background: '#ef4444', borderRadius: '4px', fontSize: '0.75rem', color: '#fff' }}>
+                    ⚡ Barge-in Captured
+                  </span>
+                )}
+              </div>
+            </div>
+          ) : (
+            <p className="rag-empty">Acoustic analysis updates every 1.5s while mic is active</p>
+          )}
+        </div>
+      </div>
+
       {/* --- Two-Column Grid: History + RAG --- */}
       <div className="panels-grid">
         {/* --- Conversation History Panel --- */}
@@ -770,6 +948,33 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {/* --- Post-Call Report Modal --- */}
+      {(reportLoading || reportData) && (
+        <div className="report-modal-overlay">
+          <div className="report-modal">
+            <div className="report-modal__header">
+              <h2>Post-Call Report</h2>
+              {reportData && (
+                <button className="report-modal__close" onClick={() => setReportData(null)}>
+                  ✕
+                </button>
+              )}
+            </div>
+            <div className="report-modal__body">
+              {reportLoading ? (
+                <div className="report-loading">
+                  <span className="thinking-dots"><span /><span /><span /></span>
+                  <p>Generating QA Report with Gemini...</p>
+                </div>
+              ) : (
+                <div className="report-content markdown-body" dangerouslySetInnerHTML={{ __html: reportData.replace(/\n/g, '<br/>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/# (.*?)\<br\/\>/g, '<h3>$1</h3>') }} />
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }

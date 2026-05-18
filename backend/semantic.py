@@ -51,9 +51,8 @@ async def analyze_utterance(
     if conversation_summary:
         prompt = f"Conversation so far: {conversation_summary}\n\n{prompt}"
 
-    response = await model.generate_content_async(prompt)
-
     try:
+        response = await model.generate_content_async(prompt)
         return json.loads(response.text)
     except json.JSONDecodeError:
         # Fallback if Gemini returns malformed JSON
@@ -65,4 +64,17 @@ async def analyze_utterance(
             "escalation_recommended": False,
             "one_line_summary": utterance[:100],
             "recommended_tone": "professional",
+        }
+    except Exception as e:
+        # Graceful fallback for 429 Quota Exceeded or other API errors
+        print(f"[SEMANTIC] Gemini API error (Rate limit/Quota?): {e}")
+        return {
+            "intent": "unknown",
+            "sentiment": 0.0,
+            "urgency_level": "low",
+            "compliance_flag": False,
+            "escalation_recommended": False,
+            "one_line_summary": utterance[:100],
+            "recommended_tone": "professional",
+            "error": "api_error"
         }
