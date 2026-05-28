@@ -1,8 +1,8 @@
 """
-miniVoxSetu — Backend Entry Point (Phase 3: Acoustic Intelligence Layer)
+miniVoxSetu — Backend Entry Point (Phase 4: Latency-Optimized Pipeline)
 Architecture: Browser audio → asyncio.Queue fork → STT path + Acoustic path
-On complete utterance: fires main pipeline AND semantic analysis concurrently.
-Acoustic PCM chunks arrive separately via AudioWorklet → analyzed via ThreadPoolExecutor.
+LLM: Groq LLaMA 3.1 70B (TTFT ~100ms vs Gemini's ~400ms)
+Semantic/Reports: Still Gemini (background, non-latency-critical)
 """
 
 import os
@@ -10,9 +10,11 @@ import json
 import asyncio
 import base64
 import time
+import traceback
 from typing import Optional
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -21,7 +23,7 @@ import google.generativeai as genai
 from rag import RAGEngine
 from pii import redact_pii
 from stt import DeepgramSTT
-from tts import synthesize, detect_sentence_boundary
+from tts import DeepgramTTS, synthesize_http, detect_sentence_boundary
 from semantic import analyze_utterance
 from acoustic import analyze_audio, init_hubert_model
 
@@ -29,16 +31,20 @@ load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not found in .env")
 if not DEEPGRAM_API_KEY:
     raise ValueError("DEEPGRAM_API_KEY not found in .env")
-if not ELEVENLABS_API_KEY:
-    raise ValueError("ELEVENLABS_API_KEY not found in .env")
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY not found in .env")
 
 genai.configure(api_key=GEMINI_API_KEY)
+
+# Groq API config
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 rag_engine: Optional[RAGEngine] = None
 
@@ -46,7 +52,7 @@ rag_engine: Optional[RAGEngine] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global rag_engine
-    rag_engine = RAGEngine(api_key=GEMINI_API_KEY)
+    rag_engine = RAGEngine()
     rag_engine.initialize()
     print("[OK] RAG engine initialized")
 
@@ -91,6 +97,38 @@ async def health_check():
     return {"status": "ok", "rag_initialized": rag_engine is not None}
 
 
+# --- B6: Backchannel Detection ---
+BACKCHANNEL_WORDS = {
+    "uh-huh", "uhuh", "uh", "huh", "hmm", "mm", "mmm", "mhm",
+    "yeah", "yep", "yea", "yes", "right", "okay", "ok", "kay",
+    "sure", "fine", "alright", "gotcha", "got it",
+    "haan", "ha", "accha", "acha", "theek", "thik", "sahi",
+    "go on", "continue", "and", "then", "so",
+}
+
+INTERRUPT_SIGNALS = {
+    "wait", "stop", "no", "wrong", "not", "actually", "but",
+    "what", "when", "where", "how", "why", "which", "who",
+    "block", "transfer", "check", "cancel", "show", "tell",
+    "help", "problem", "issue", "complaint", "balance", "account",
+    "payment", "card", "loan", "emi", "transaction",
+}
+
+
+def is_backchannel(transcript: str) -> bool:
+    """Check if a short utterance is a backchannel response (not a real interruption)."""
+    words = transcript.lower().strip().split()
+    if len(words) == 0:
+        return False
+    if len(words) > 3:
+        return False  # Real sentences are not backchannel
+    if any(w in INTERRUPT_SIGNALS for w in words):
+        return False  # Contains a real intent word
+    if any(w in BACKCHANNEL_WORDS for w in words):
+        return True
+    return False
+
+
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
     await websocket.accept()
@@ -101,6 +139,8 @@ async def websocket_chat(websocket: WebSocket):
     current_pipeline_task = None
     current_semantic_task = None
     is_speaking = False
+    barged_in = False  # B4: Server-side gate — blocks in-flight audio after barge-in
+    pipeline_generation = 0  # B5: Monotonic counter — incremented on every barge-in/reset
 
     # --- Semantic layer state ---
     # One-turn-behind buffer: semantic result from previous turn,
@@ -115,6 +155,10 @@ async def websocket_chat(websocket: WebSocket):
     acoustic_chunks_this_turn = []  # accumulate per-turn for averaging
     current_acoustic_task = None
 
+    # --- Speculative RAG state ---
+    # Cache for early RAG results triggered at confidence >= 0.7
+    speculative_rag_cache = {"query": "", "chunks": [], "embedding": None}
+
     # --- Audio forking queues ---
     # In production, FreeSWITCH duplicates RTP into two WebSocket streams.
     # Here, we duplicate the browser audio into two asyncio queues.
@@ -124,6 +168,25 @@ async def websocket_chat(websocket: WebSocket):
     # --- Deepgram STT setup ---
     stt = DeepgramSTT(api_key=DEEPGRAM_API_KEY)
     stt_connected = False  # Track whether Deepgram is connected
+
+    # --- Deepgram TTS setup (persistent WebSocket per session) ---
+    tts = DeepgramTTS(api_key=DEEPGRAM_API_KEY)
+    tts_connected = False
+
+    # --- Deepgram keep-alive ---
+    async def deepgram_keepalive():
+        """Send KeepAlive messages to Deepgram every 8s to prevent timeout
+        during periods when the agent is speaking (no mic audio forwarded)."""
+        try:
+            while True:
+                await asyncio.sleep(8)
+                if stt_connected and stt.ws and stt.is_connected():
+                    try:
+                        await stt.ws.send(json.dumps({"type": "KeepAlive"}))
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            pass
 
     # --- Lazy Deepgram Connection ---
     async def ensure_stt_connected():
@@ -136,7 +199,7 @@ async def websocket_chat(websocket: WebSocket):
             if stt.ws:  # Close stale connection if any
                 await stt.close()
             stt_connected = False
-            await stt.connect(on_transcript, on_utterance_end)
+            await stt.connect(on_transcript, on_utterance_end, on_confident_interim)
             stt_connected = True
             print("[STT] Deepgram connected (lazy init on first audio)")
             return True
@@ -206,15 +269,44 @@ async def websocket_chat(websocket: WebSocket):
             print(f"[ACOUSTIC] Error: {e}")
 
     # --- Transcript callback ---
-    async def on_transcript(text: str, is_final: bool):
+    async def on_transcript(text: str, is_final: bool, confidence: float = 0.0):
         try:
             await websocket.send_text(json.dumps({
                 "type": "transcript",
                 "text": text,
                 "is_final": is_final,
+                "confidence": confidence,
             }))
         except Exception:
             pass
+
+    # --- Speculative RAG callback (fires at confidence >= 0.7) ---
+    async def on_confident_interim(text: str):
+        """Run RAG query early on high-confidence interim text.
+        Result is cached and reused if final text is similar enough."""
+        nonlocal speculative_rag_cache
+        if not rag_engine or is_speaking:
+            return
+        try:
+            # Only re-query if text has changed significantly from last speculative query
+            if speculative_rag_cache["query"] and text.startswith(speculative_rag_cache["query"][:20]):
+                return  # Same prefix, cached result is likely still valid
+
+            import time as _time
+            start = _time.time()
+            results = rag_engine.retrieve(text, n_results=2)
+            elapsed = round((_time.time() - start) * 1000)
+
+            # Cache the query embedding for similarity comparison later
+            query_embedding = rag_engine._embed_query(text)
+            speculative_rag_cache = {
+                "query": text,
+                "chunks": results,
+                "embedding": query_embedding,
+            }
+            print(f"[RAG] ⚡ Speculative RAG cached: '{text[:50]}...' → {len(results)} chunks in {elapsed}ms")
+        except Exception as e:
+            print(f"[RAG] Speculative RAG error: {e}")
 
     # --- Utterance end: fire BOTH main pipeline and semantic analysis ---
     async def on_utterance_end(full_text: str):
@@ -225,9 +317,12 @@ async def websocket_chat(websocket: WebSocket):
         print(f"[STT] Utterance: {full_text}")
         turn_counter += 1
 
+        # B5: Capture generation at launch time
+        gen = pipeline_generation
+
         # Fire main pipeline
         current_pipeline_task = asyncio.create_task(
-            run_pipeline(full_text, turn_counter)
+            run_pipeline(full_text, turn_counter, gen)
         )
 
         # Snapshot acoustic chunks for this turn and reset for next turn
@@ -318,26 +413,71 @@ async def websocket_chat(websocket: WebSocket):
             print(f"[SEMANTIC] Error: {e}")
 
     # --- Main Voice Pipeline ---
-    async def run_pipeline(user_text: str, turn_id: int):
-        nonlocal is_speaking
+    async def run_pipeline(user_text: str, turn_id: int, expected_generation: int = -1):
+        nonlocal is_speaking, barged_in, speculative_rag_cache
 
+        # B5: Stale pipeline guard — abort if generation changed since launch
+        if expected_generation >= 0 and pipeline_generation != expected_generation:
+            print(f"[PIPELINE] Turn {turn_id} skipped (stale generation {expected_generation} != {pipeline_generation})")
+            return
+
+        print(f"[PIPELINE] Starting pipeline for turn {turn_id}: '{user_text[:80]}'")
         try:
             await websocket.send_text(json.dumps({"type": "state", "state": "THINKING"}))
+
+            # Lazy TTS connection (only connect when first pipeline fires)
+            nonlocal tts_connected
+            if not tts_connected or not tts.is_connected():
+                try:
+                    await tts.connect()
+                    tts_connected = True
+                except Exception as tts_conn_err:
+                    print(f"[TTS] ⚠️ WebSocket connect failed: {tts_conn_err}, will use HTTP fallback")
+                    tts_connected = False
 
             # Step 1: PII Redaction
             user_text, pii_findings = redact_pii(user_text)
             if pii_findings:
                 print(f"[PII] Redacted: {pii_findings}")
 
-            # Step 2: RAG Retrieval
+            # B5: Check generation after PII (async boundary)
+            if expected_generation >= 0 and pipeline_generation != expected_generation:
+                print(f"[PIPELINE] Turn {turn_id} aborted after PII (stale generation)")
+                return
+
+            # Step 2: RAG Retrieval (use speculative cache if available)
             rag_context = ""
             rag_chunks = []
             if rag_engine:
-                results = rag_engine.retrieve(user_text, n_results=2)
-                if results:
-                    rag_chunks = results
+                # Check if we have a valid speculative RAG cache
+                cache_used = False
+                if speculative_rag_cache["chunks"] and speculative_rag_cache["embedding"]:
+                    # Compare final text embedding to cached query embedding
+                    final_embedding = rag_engine._embed_query(user_text)
+                    cached_embedding = speculative_rag_cache["embedding"]
+                    # Cosine similarity between final and speculative queries
+                    import numpy as _np
+                    cos_sim = float(_np.dot(final_embedding, cached_embedding) / (
+                        _np.linalg.norm(final_embedding) * _np.linalg.norm(cached_embedding)
+                    ))
+                    if cos_sim > 0.85:
+                        rag_chunks = speculative_rag_cache["chunks"]
+                        cache_used = True
+                        print(f"[RAG] ✅ Using speculative cache (similarity={cos_sim:.3f})")
+                    else:
+                        print(f"[RAG] ⚠️ Speculative cache stale (similarity={cos_sim:.3f}), re-querying")
+
+                if not cache_used:
+                    results = rag_engine.retrieve(user_text, n_results=2)
+                    if results:
+                        rag_chunks = results
+
+                # Reset speculative cache after use
+                speculative_rag_cache = {"query": "", "chunks": [], "embedding": None}
+
+                if rag_chunks:
                     rag_context = "\n\n---\nRelevant knowledge base context:\n"
-                    rag_context += "\n".join(f"- {c}" for c in results)
+                    rag_context += "\n".join(f"- {c}" for c in rag_chunks)
                     rag_context += "\n---\n"
 
             await websocket.send_text(json.dumps({
@@ -374,58 +514,120 @@ async def websocket_chat(websocket: WebSocket):
                     "Adapt your tone based on how the caller SOUNDS, not just what they say.\n---\n"
                 )
 
-            # Step 4: Gemini with conversation history
-            gemini_history = []
+            # Step 4: Build OpenAI-format messages for Groq
+            messages = [{"role": "system", "content": enhanced_prompt}]
             for turn in conversation_history:
-                role = "user" if turn["role"] == "user" else "model"
-                gemini_history.append({"role": role, "parts": [turn["content"]]})
+                messages.append({"role": turn["role"], "content": turn["content"]})
+            messages.append({"role": "user", "content": user_text})
 
-            model = genai.GenerativeModel(
-                "gemini-2.5-flash",
-                system_instruction=enhanced_prompt,
-            )
-            chat = model.start_chat(history=gemini_history)
+            # Step 5: Stream LLM response from Groq with cascaded TTS
+            # B5: Final generation check before committing to SPEAKING state
+            if expected_generation >= 0 and pipeline_generation != expected_generation:
+                print(f"[PIPELINE] Turn {turn_id} aborted before Groq (stale generation)")
+                return
 
-            # Step 5: Stream LLM response with cascaded TTS
             is_speaking = True
+            barged_in = False  # B4: Reset barge-in gate for new pipeline
             await websocket.send_text(json.dumps({"type": "state", "state": "SPEAKING"}))
 
             full_response = ""
             text_buffer = ""
 
-            response = await chat.send_message_async(user_text, stream=True)
+            print(f"[PIPELINE] Calling Groq {GROQ_MODEL} (stream=True)...")
+            groq_start = time.time()
+            first_token_logged = False
 
-            async for chunk in response:
-                if not is_speaking:
-                    break
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                async with client.stream(
+                    "POST",
+                    GROQ_API_URL,
+                    headers={
+                        "Authorization": f"Bearer {GROQ_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": GROQ_MODEL,
+                        "messages": messages,
+                        "stream": True,
+                        "max_tokens": 512,
+                        "temperature": 0.7,
+                    },
+                ) as response:
+                    if response.status_code != 200:
+                        error_body = await response.aread()
+                        raise Exception(f"Groq API returned {response.status_code}: {error_body.decode()[:300]}")
 
-                if chunk.text:
-                    full_response += chunk.text
-                    text_buffer += chunk.text
+                    async for line in response.aiter_lines():
+                        # B4: Hard stop if barge-in flag is set
+                        if barged_in:
+                            break
+                        if not is_speaking:
+                            break
 
-                    await websocket.send_text(json.dumps({
-                        "type": "chunk",
-                        "text": chunk.text,
-                    }))
+                        # SSE format: "data: {...}" or "data: [DONE]"
+                        if not line.startswith("data: "):
+                            continue
+                        payload = line[6:]  # strip "data: " prefix
+                        if payload == "[DONE]":
+                            break
 
-                    sentence, remaining = detect_sentence_boundary(text_buffer)
-                    if sentence:
-                        text_buffer = remaining
                         try:
-                            audio_bytes = await synthesize(sentence, ELEVENLABS_API_KEY)
-                            audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-                            await websocket.send_text(json.dumps({
-                                "type": "audio",
-                                "data": audio_b64,
-                                "format": "mp3",
-                            }))
-                        except Exception as e:
-                            print(f"[TTS] Error: {e}")
+                            chunk_data = json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
+
+                        delta = chunk_data.get("choices", [{}])[0].get("delta", {})
+                        token_text = delta.get("content", "")
+
+                        if not token_text:
+                            continue
+
+                        if not first_token_logged:
+                            ttft = round((time.time() - groq_start) * 1000)
+                            print(f"[PIPELINE] ⚡ Groq TTFT: {ttft}ms")
+                            first_token_logged = True
+
+                        full_response += token_text
+                        text_buffer += token_text
+
+                        await websocket.send_text(json.dumps({
+                            "type": "chunk",
+                            "text": token_text,
+                        }))
+
+                        sentence, remaining = detect_sentence_boundary(text_buffer)
+                        if sentence:
+                            text_buffer = remaining
+                            # B4: Skip TTS synthesis and send if barged in
+                            if barged_in:
+                                continue
+                            try:
+                                print(f"[TTS] Synthesizing: '{sentence[:60]}...'")
+                                if tts_connected and tts.is_connected():
+                                    audio_bytes = await tts.synthesize(sentence)
+                                else:
+                                    audio_bytes = await synthesize_http(sentence, DEEPGRAM_API_KEY)
+                                # B4: Re-check after async TTS call
+                                if barged_in:
+                                    continue
+                                print(f"[TTS] ✅ Got {len(audio_bytes)} bytes of audio")
+                                audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+                                await websocket.send_text(json.dumps({
+                                    "type": "audio",
+                                    "data": audio_b64,
+                                    "format": "mp3",
+                                }))
+                            except Exception as e:
+                                print(f"[TTS] ❌ Error: {e}")
+                                traceback.print_exc()
 
             # TTS remaining buffer
-            if text_buffer.strip() and is_speaking:
+            if text_buffer.strip() and is_speaking and not barged_in:
                 try:
-                    audio_bytes = await synthesize(text_buffer.strip(), ELEVENLABS_API_KEY)
+                    if tts_connected and tts.is_connected():
+                        audio_bytes = await tts.synthesize(text_buffer.strip())
+                    else:
+                        audio_bytes = await synthesize_http(text_buffer.strip(), DEEPGRAM_API_KEY)
                     audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
                     await websocket.send_text(json.dumps({
                         "type": "audio",
@@ -434,6 +636,9 @@ async def websocket_chat(websocket: WebSocket):
                     }))
                 except Exception as e:
                     print(f"[TTS] Error on final chunk: {e}")
+
+            groq_total = round((time.time() - groq_start) * 1000)
+            print(f"[PIPELINE] Groq total generation: {groq_total}ms, response length: {len(full_response)} chars")
 
             # Update conversation history
             conversation_history.append({"role": "user", "content": user_text})
@@ -448,21 +653,26 @@ async def websocket_chat(websocket: WebSocket):
             await websocket.send_text(json.dumps({"type": "state", "state": "LISTENING"}))
 
         except asyncio.CancelledError:
+            print(f"[PIPELINE] Turn {turn_id} cancelled (barge-in)")
             is_speaking = False
         except Exception as e:
             error_str = str(e)
-            print(f"[PIPELINE] Error: {error_str}")
+            print(f"[PIPELINE] ❌ Error in turn {turn_id}: {error_str}")
+            traceback.print_exc()
             
-            # If we hit the Gemini Free Tier Rate Limit, speak a graceful fallback
-            if "429" in error_str or "quota" in error_str.lower():
+            # If we hit rate limits (Groq free tier: 30 req/min)
+            if "429" in error_str or "rate" in error_str.lower() or "quota" in error_str.lower():
                 try:
-                    fallback_text = "I apologize, but my language processing systems are currently hitting a rate limit. Please wait about a minute before speaking again."
+                    fallback_text = "I apologize, but I'm currently experiencing high traffic. Please wait a moment and try again."
                     await websocket.send_text(json.dumps({
                         "type": "chunk",
                         "text": fallback_text,
                     }))
                     
-                    audio_bytes = await synthesize(fallback_text, ELEVENLABS_API_KEY)
+                    if tts_connected and tts.is_connected():
+                        audio_bytes = await tts.synthesize(fallback_text)
+                    else:
+                        audio_bytes = await synthesize_http(fallback_text, DEEPGRAM_API_KEY)
                     audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
                     await websocket.send_text(json.dumps({
                         "type": "audio",
@@ -473,10 +683,13 @@ async def websocket_chat(websocket: WebSocket):
                     print(f"[TTS] Fallback error: {tts_err}")
             else:
                 # For non-rate-limit errors, send to UI
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "message": error_str,
-                }))
+                try:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": error_str,
+                    }))
+                except Exception:
+                    print(f"[PIPELINE] ❌ Also failed to send error to client")
             
             is_speaking = False
 
@@ -488,6 +701,7 @@ async def websocket_chat(websocket: WebSocket):
     # connects before the user clicks the mic button.
     stt_task = asyncio.create_task(stt_consumer())
     acoustic_task = asyncio.create_task(acoustic_drain())
+    keepalive_task = asyncio.create_task(deepgram_keepalive())
     print("[STT] Deepgram will connect lazily when mic audio starts")
 
     # --- Main receive loop ---
@@ -521,8 +735,30 @@ async def websocket_chat(websocket: WebSocket):
 
                 if msg_type == "barge_in":
                     print("[BARGE-IN] User interrupted")
+
+                    # B6: Check if the interruption is just a backchannel response
+                    latest_transcript = " ".join(stt._final_segments).strip() if stt._final_segments else ""
+                    if latest_transcript and is_backchannel(latest_transcript):
+                        print(f"[BARGE-IN] B6: Backchannel detected: '{latest_transcript}' — soft pause only")
+                        # Soft pause: stop current audio but don't kill the pipeline
+                        if tts_connected and tts.is_connected():
+                            await tts.clear()
+                        stt.flush()
+                        # Don't cancel pipeline, don't increment generation, don't set barged_in
+                        # The pipeline will continue generating and sending the next sentence
+                        await asyncio.sleep(0.3)  # 300ms pause for natural rhythm
+                        continue
+
+                    # Full barge-in reset (not backchannel)
+                    # B4: Set barge-in gate FIRST — blocks in-flight sends
+                    barged_in = True
+                    # B5: Increment generation counter — invalidates any in-flight pipeline
+                    pipeline_generation += 1
                     is_speaking = False
                     stt.flush()
+                    # Clear TTS buffer server-side (stops pending audio)
+                    if tts_connected and tts.is_connected():
+                        await tts.clear()
                     # Cancel main pipeline
                     if current_pipeline_task and not current_pipeline_task.done():
                         current_pipeline_task.cancel()
@@ -551,6 +787,8 @@ async def websocket_chat(websocket: WebSocket):
                     # --- Barge-in cleanup if agent is mid-speech ---
                     if is_speaking or (current_pipeline_task and not current_pipeline_task.done()):
                         print("[BARGE-IN] Text input while speaking — flushing")
+                        barged_in = True  # B4
+                        pipeline_generation += 1  # B5
                         is_speaking = False
                         stt.flush()
                         if current_pipeline_task and not current_pipeline_task.done():
@@ -567,8 +805,9 @@ async def websocket_chat(websocket: WebSocket):
                     ]
                     if text.strip():
                         turn_counter += 1
+                        gen = pipeline_generation  # B5: Capture generation
                         current_pipeline_task = asyncio.create_task(
-                            run_pipeline(text, turn_counter)
+                            run_pipeline(text, turn_counter, gen)
                         )
                         # Also run semantic on text input
                         current_semantic_task = asyncio.create_task(
@@ -595,9 +834,12 @@ async def websocket_chat(websocket: WebSocket):
                                     log_text += f"Emotion: {ac.get('emotion', 'unknown')}, Stress: {ac.get('stress_score', 0):.0%}\n"
                                 log_text += f"Interrupted: {turn['interrupted']}\n"
 
+                            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                            formatted_date = datetime.datetime.now().strftime("%B %d, %Y")
                             prompt = (
                                 "You are a Quality Assurance AI for NeoBank's call center. "
-                                "Review the following call log and generate a brief Post-Call Report in Markdown. "
+                                "Review the following call log and generate a brief Post-Call Report in Markdown.\n"
+                                f"IMPORTANT CONTEXT:\n- Call ID: {timestamp}\n- Date: {formatted_date}\n- Agent: Harris\n\n"
                                 "Include:\n1. Executive Summary\n2. Primary Intent & Resolution\n3. Caller Sentiment & Stress progression\n4. Action Items / Follow-ups.\n"
                                 f"\nCall Log:\n{log_text}"
                             )
@@ -640,8 +882,11 @@ async def websocket_chat(websocket: WebSocket):
         # Cleanup
         stt_task.cancel()
         acoustic_task.cancel()
+        keepalive_task.cancel()
         if stt_connected:
             await stt.close()
+        if tts_connected:
+            await tts.close()
         if current_pipeline_task and not current_pipeline_task.done():
             current_pipeline_task.cancel()
         if current_semantic_task and not current_semantic_task.done():

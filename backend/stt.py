@@ -25,7 +25,7 @@ DEEPGRAM_PARAMS = (
     "&language=en"
     "&smart_format=true"
     "&interim_results=true"
-    "&utterance_end_ms=1500"
+    "&utterance_end_ms=1000"
     "&endpointing=300"
     "&vad_events=true"
     "&encoding=linear16"
@@ -42,6 +42,7 @@ class DeepgramSTT:
         self._final_segments = []  # accumulate finalized text segments
         self._bytes_sent = 0       # DEBUG: track total bytes sent
         self._first_msg_logged = False  # DEBUG: log first Deepgram response
+        self._early_fired = False  # Prevent double-fire when UtteranceEnd follows early trigger
 
     def is_connected(self):
         """Check if the WebSocket is open (compatible with websockets v15+)."""
@@ -55,11 +56,12 @@ class DeepgramSTT:
             # Fallback for older versions
             return getattr(self.ws, 'open', False)
 
-    async def connect(self, on_transcript, on_utterance_end):
+    async def connect(self, on_transcript, on_utterance_end, on_confident_interim=None):
         """
         Open WebSocket to Deepgram. Callbacks:
-        - on_transcript(text, is_final): called on every transcript event
+        - on_transcript(text, is_final, confidence): called on every transcript event
         - on_utterance_end(full_text): called when user finishes speaking
+        - on_confident_interim(text): called on interim/final with confidence >= 0.7 (for speculative RAG)
         """
         url = DEEPGRAM_WS_URL + DEEPGRAM_PARAMS
         headers = {"Authorization": f"Token {self.api_key}"}
@@ -74,9 +76,11 @@ class DeepgramSTT:
         print(f"[STT] ✅ Deepgram WebSocket connected successfully")
         self._on_transcript = on_transcript
         self._on_utterance_end = on_utterance_end
+        self._on_confident_interim = on_confident_interim
         self._final_segments = []
         self._bytes_sent = 0
         self._first_msg_logged = False
+        self._early_fired = False
         self._listener_task = asyncio.create_task(self._listen())
 
     async def send(self, audio_bytes: bytes):
@@ -87,8 +91,8 @@ class DeepgramSTT:
         try:
             self._bytes_sent += len(audio_bytes)
             await self.ws.send(audio_bytes)
-            # Log first 5 sends, then every 50KB
-            if self._bytes_sent <= 5 * len(audio_bytes) or self._bytes_sent % 50000 < len(audio_bytes):
+            # Log first 5 sends only to avoid terminal clutter
+            if self._bytes_sent <= 5 * len(audio_bytes):
                 print(f"[STT] 📤 Sent {len(audio_bytes)} bytes (total: {self._bytes_sent:,}), connected={self.is_connected()}")
         except websockets.exceptions.ConnectionClosed as e:
             print(f"[STT] ❌ Failed to send audio — connection closed: {e}")
@@ -127,26 +131,52 @@ class DeepgramSTT:
                 if msg_type == "Results":
                     alt = data["channel"]["alternatives"][0]
                     transcript = alt.get("transcript", "")
+                    confidence = alt.get("confidence", 0.0)
                     is_final = data.get("is_final", False)
                     speech_final = data.get("speech_final", False)
 
                     if transcript:
-                        print(f"[STT] 🗣️ {'FINAL' if is_final else 'interim'}: \"{transcript}\"")
-                        await self._on_transcript(transcript, is_final)
+                        print(f"[STT] 🗣️ {'FINAL' if is_final else 'interim'} (conf={confidence:.2f}): \"{transcript}\"")
+                        await self._on_transcript(transcript, is_final, confidence)
+
+                    # Speculative RAG callback: fire on any transcript with confidence >= 0.7
+                    if transcript and confidence >= 0.7 and self._on_confident_interim:
+                        # Build speculative text from accumulated segments + current
+                        speculative_text = " ".join(self._final_segments + [transcript]).strip()
+                        if len(speculative_text.split()) >= 3:  # at least 3 words
+                            await self._on_confident_interim(speculative_text)
 
                     # Accumulate finalized segments for full utterance
                     if is_final and transcript:
                         self._final_segments.append(transcript)
 
+                    # === HYBRID EARLY TRIGGER ===
+                    # If Deepgram's endpointing detected a natural pause (speech_final=True)
+                    # AND the segment has high confidence (>= 0.9), fire the pipeline immediately
+                    # instead of waiting for the 800ms UtteranceEnd timeout.
+                    if speech_final and is_final and confidence >= 0.9 and self._final_segments:
+                        full_text = " ".join(self._final_segments).strip()
+                        if full_text:
+                            print(f"[STT] ⚡ EARLY TRIGGER (speech_final + conf={confidence:.2f}): \"{full_text}\"")
+                            self._final_segments = []
+                            self._early_fired = True
+                            await self._on_utterance_end(full_text)
+
                 elif msg_type == "UtteranceEnd":
-                    # User finished speaking — combine all final segments
-                    full_text = " ".join(self._final_segments).strip()
-                    self._final_segments = []
-                    if full_text:
-                        print(f"[STT] ✅ Utterance complete: \"{full_text}\"")
-                        await self._on_utterance_end(full_text)
+                    # If we already early-fired for this utterance, skip the duplicate
+                    if self._early_fired:
+                        print(f"[STT] ⏭️ UtteranceEnd skipped (already early-fired)")
+                        self._early_fired = False
+                        self._final_segments = []  # Clean up any stragglers
                     else:
-                        print(f"[STT] ⚠️ UtteranceEnd received but no final segments accumulated")
+                        # Standard path: user finished speaking — combine all final segments
+                        full_text = " ".join(self._final_segments).strip()
+                        self._final_segments = []
+                        if full_text:
+                            print(f"[STT] ✅ Utterance complete: \"{full_text}\"")
+                            await self._on_utterance_end(full_text)
+                        else:
+                            print(f"[STT] ⚠️ UtteranceEnd received but no final segments accumulated")
                         
                 elif msg_type == "SpeechStarted":
                     print(f"[STT] 🎙️ Speech started detected by Deepgram VAD")
@@ -171,3 +201,4 @@ class DeepgramSTT:
     def flush(self):
         """Clear accumulated segments (called on barge-in)."""
         self._final_segments = []
+        self._early_fired = False

@@ -6,6 +6,7 @@ python-dotenv==1.1.0
 
 # AI / LLM
 google-generativeai==0.8.5
+sentence-transformers>=3.0.0
 
 # Math (cosine similarity for RAG)
 numpy==2.2.5

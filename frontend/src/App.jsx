@@ -152,10 +152,13 @@ export default function App() {
   const isPlayingRef = useRef(false);
   const currentAudioSourceRef = useRef(null);
   const audioContextRef = useRef(null);
+  const bargedInRef = useRef(false); // Prevents queued audio from playing after barge-in
 
   // --- VAD / Barge-in ---
   const analyserRef = useRef(null);
   const vadIntervalRef = useRef(null);
+  const energyThresholdRef = useRef(30);     // B1: Dynamic threshold (calibrated at mic start)
+  const ttsSuppressUntilRef = useRef(0);     // B2: Timestamp until which VAD is suppressed
 
   // --- Refs ---
   const historyPanelRef = useRef(null);
@@ -164,6 +167,14 @@ export default function App() {
   // Sync state to ref for use in callbacks
   useEffect(() => {
     agentStateRef.current = agentState;
+
+    // B3: Notify AudioWorklet of agent speaking state for VAD gating
+    if (audioWorkletNodeRef.current) {
+      audioWorkletNodeRef.current.port.postMessage({
+        type: 'agent_state',
+        speaking: agentState === STATES.SPEAKING,
+      });
+    }
   }, [agentState]);
 
   // Auto-scroll conversation history
@@ -230,6 +241,11 @@ export default function App() {
               sample_rate: sampleRate
             });
           }
+
+          // B3: Worklet-based barge-in detection (~2.7ms latency vs 100ms setInterval)
+          else if (event.data.type === 'barge_in_detected') {
+            handleBargeIn();
+          }
         };
 
         source.connect(pcmNode);
@@ -244,8 +260,42 @@ export default function App() {
 
       isRecordingRef.current = true;
 
-      // Start barge-in energy monitoring
-      startBargeInDetection();
+      // B1: Calibrate ambient noise for 500ms before starting VAD
+      const calibrateSamples = [];
+      const CALIBRATION_MS = 500;
+      const calInterval = setInterval(() => {
+        const calData = new Float32Array(analyser.fftSize);
+        analyser.getFloatTimeDomainData(calData);
+        let sumSquares = 0;
+        for (let i = 0; i < calData.length; i++) {
+          sumSquares += calData[i] * calData[i];
+        }
+        const rms = Math.sqrt(sumSquares / calData.length);
+        calibrateSamples.push(rms);
+      }, 50);
+
+      await new Promise((resolve) => setTimeout(resolve, CALIBRATION_MS));
+      clearInterval(calInterval);
+
+      if (calibrateSamples.length > 0) {
+        const baseline = calibrateSamples.reduce((a, b) => a + b, 0) / calibrateSamples.length;
+        // Set dynamic threshold: 2.5x baseline, with a minimum floor of 0.01 (raw RMS)
+        const dynamicThreshold = Math.max(0.01, baseline * 2.5);
+        energyThresholdRef.current = dynamicThreshold;
+        console.log(`[VAD] Baseline RMS: ${baseline.toFixed(4)}, Threshold: ${dynamicThreshold.toFixed(4)}`);
+
+        // B3: Send calibrated threshold to AudioWorklet
+        if (audioWorkletNodeRef.current) {
+          audioWorkletNodeRef.current.port.postMessage({
+            type: 'set_threshold',
+            threshold: dynamicThreshold
+          });
+        }
+      }
+
+      // B3: Barge-in detection now runs in AudioWorklet (pcm-processor.js)
+      // The setInterval VAD is no longer needed — worklet fires barge_in_detected
+      // at ~2.7ms frame rate instead of 100ms polling.
 
       setAgentState(STATES.LISTENING);
       setSttError('');
@@ -277,42 +327,24 @@ export default function App() {
       mediaStreamRef.current = null;
     }
 
-    if (vadIntervalRef.current) {
-      clearInterval(vadIntervalRef.current);
-      vadIntervalRef.current = null;
-    }
-
     setAgentState(STATES.IDLE);
   }, [sendJSON]);
 
   // ============================================================
-  // BARGE-IN DETECTION (energy threshold on AnalyserNode)
+  // BARGE-IN DETECTION — B3: Now handled in AudioWorklet (pcm-processor.js)
+  // The worklet calculates RMS energy per 128-sample frame (~2.7ms at 48kHz)
+  // and posts 'barge_in_detected' to the main thread when threshold is exceeded.
+  // The old setInterval(100ms) polling has been removed.
   // ============================================================
-
-  const startBargeInDetection = useCallback(() => {
-    if (vadIntervalRef.current) clearInterval(vadIntervalRef.current);
-
-    const ENERGY_THRESHOLD = 30;
-
-    vadIntervalRef.current = setInterval(() => {
-      if (!analyserRef.current) return;
-      if (agentStateRef.current !== STATES.SPEAKING) return;
-
-      const data = new Uint8Array(analyserRef.current.frequencyBinCount);
-      analyserRef.current.getByteFrequencyData(data);
-      const avg = data.reduce((a, b) => a + b, 0) / data.length;
-
-      if (avg > ENERGY_THRESHOLD) {
-        handleBargeIn();
-      }
-    }, 100);
-  }, []);
 
   // ============================================================
   // BARGE-IN HANDLER
   // ============================================================
 
   const handleBargeIn = useCallback(() => {
+    // Set barge-in flag FIRST to block any incoming audio from being queued
+    bargedInRef.current = true;
+
     // Stop TTS audio playback
     if (currentAudioSourceRef.current) {
       try {
@@ -336,6 +368,12 @@ export default function App() {
   // ============================================================
 
   const playNextAudio = useCallback(async () => {
+    // B7 fix: If barge-in happened, drain queue and do not play
+    if (bargedInRef.current) {
+      audioQueueRef.current = [];
+      isPlayingRef.current = false;
+      return;
+    }
     if (isPlayingRef.current || audioQueueRef.current.length === 0) return;
 
     isPlayingRef.current = true;
@@ -351,6 +389,14 @@ export default function App() {
       }
 
       const audioBuffer = await audioCtx.decodeAudioData(audioData.buffer);
+
+      // B7 fix: Re-check after async decode — barge-in may have fired during decodeAudioData
+      if (bargedInRef.current) {
+        isPlayingRef.current = false;
+        audioQueueRef.current = [];
+        return;
+      }
+
       const source = audioCtx.createBufferSource();
       source.buffer = audioBuffer;
       source.connect(audioCtx.destination);
@@ -360,6 +406,8 @@ export default function App() {
       source.onended = () => {
         currentAudioSourceRef.current = null;
         isPlayingRef.current = false;
+        // B7 fix: Don't chain to next audio if barge-in happened
+        if (bargedInRef.current) return;
         // Play next queued audio or return to listening
         if (audioQueueRef.current.length > 0) {
           playNextAudio();
@@ -367,6 +415,16 @@ export default function App() {
       };
 
       source.start(0);
+
+      // B2: Set TTS suppression window — let AEC settle before VAD resumes
+      ttsSuppressUntilRef.current = Date.now() + 200;
+      // B3: Also notify worklet of TTS suppression
+      if (audioWorkletNodeRef.current) {
+        audioWorkletNodeRef.current.port.postMessage({
+          type: 'tts_suppress',
+          duration_ms: 200
+        });
+      }
     } catch (err) {
       console.error('Audio playback error:', err);
       isPlayingRef.current = false;
@@ -378,6 +436,9 @@ export default function App() {
   }, []);
 
   const queueAudio = useCallback((base64Data) => {
+    // If barge-in happened, silently drop any audio that arrives late
+    if (bargedInRef.current) return;
+
     const binaryStr = atob(base64Data);
     const bytes = new Uint8Array(binaryStr.length);
     for (let i = 0; i < binaryStr.length; i++) {
@@ -420,6 +481,7 @@ export default function App() {
             setLiveTranscript(pendingUtteranceRef.current || '');
             pendingUtteranceRef.current = '';
           } else if (message.state === 'SPEAKING') {
+            bargedInRef.current = false; // Reset barge-in flag for new response
             setAgentState(STATES.SPEAKING);
           } else if (message.state === 'LISTENING') {
             setAgentState(STATES.LISTENING);
