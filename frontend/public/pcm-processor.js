@@ -22,9 +22,12 @@ class PCMProcessor extends AudioWorkletProcessor {
     // --- B3: VAD / Barge-in detection ---
     this.isAgentSpeaking = false;    // Updated by main thread via port.postMessage
     this.energyThreshold = 0.01;       // B1: Updated after calibration via port.postMessage
+    this.speakingThresholdMultiplier = 3.0; // B8: During agent speech, threshold is 3x higher
     this.ttsSuppressUntil = 0;       // B2: Timestamp until which VAD is suppressed
     this.lastBargeInTime = 0;        // Cooldown: prevent rapid-fire barge-in messages
     this.BARGE_IN_COOLDOWN_MS = 150; // Min interval between barge-in messages
+    this.consecutiveAboveCount = 0;  // B9: Require sustained energy, not single-frame spikes
+    this.CONSECUTIVE_REQUIRED = 3;   // ~8ms of sustained speech (3 frames × 2.7ms)
 
     // --- B3: Listen for messages from main thread ---
     this.port.onmessage = (event) => {
@@ -58,17 +61,34 @@ class PCMProcessor extends AudioWorkletProcessor {
             sumSquares += inputChannel[i] * inputChannel[i];
           }
           const rms = Math.sqrt(sumSquares / inputChannel.length);
-          // Compare raw RMS to the threshold provided by App.jsx
-          const energyScaled = rms;
 
-          if (energyScaled > this.energyThreshold) {
-            // Cooldown check: don't spam barge-in messages
-            if (now - this.lastBargeInTime > this.BARGE_IN_COOLDOWN_MS) {
-              this.lastBargeInTime = now;
-              this.port.postMessage({ type: 'barge_in_detected', energy: energyScaled });
+          // B8: Use elevated threshold during agent speech to reject echo leak
+          // Echo-cancelled speaker leak is typically 2-3x ambient noise,
+          // while actual human speech is 5-10x. The 3x multiplier sits between.
+          const effectiveThreshold = this.energyThreshold * this.speakingThresholdMultiplier;
+
+          if (rms > effectiveThreshold) {
+            // B9: Require multiple consecutive frames above threshold
+            // This filters out transient pops/clicks from triggering barge-in
+            this.consecutiveAboveCount++;
+            if (this.consecutiveAboveCount >= this.CONSECUTIVE_REQUIRED) {
+              // Cooldown check: don't spam barge-in messages
+              if (now - this.lastBargeInTime > this.BARGE_IN_COOLDOWN_MS) {
+                this.lastBargeInTime = now;
+                this.port.postMessage({ type: 'barge_in_detected', energy: rms });
+              }
             }
+          } else {
+            // Reset consecutive counter on any below-threshold frame
+            this.consecutiveAboveCount = 0;
           }
+        } else {
+          // During suppression window, also reset consecutive counter
+          this.consecutiveAboveCount = 0;
         }
+      } else {
+        // Not speaking — reset consecutive counter
+        this.consecutiveAboveCount = 0;
       }
 
       // === STT PATH: Convert Float32 → Int16 and send every 100ms ===
