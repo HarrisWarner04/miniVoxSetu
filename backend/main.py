@@ -1,7 +1,7 @@
 """
 miniVoxSetu — Backend Entry Point (Phase 4: Latency-Optimized Pipeline)
 Architecture: Browser audio → asyncio.Queue fork → STT path + Acoustic path
-LLM: Groq LLaMA 3.1 70B (TTFT ~100ms vs Gemini's ~400ms)
+LLM: Groq LLaMA 3.3 70B (TTFT ~100ms vs Gemini's ~400ms)
 Semantic/Reports: Still Gemini (background, non-latency-critical)
 """
 
@@ -10,10 +10,12 @@ import json
 import asyncio
 import base64
 import time
+import datetime
 import traceback
 from typing import Optional
 from contextlib import asynccontextmanager
 
+import numpy as np
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +28,7 @@ from stt import DeepgramSTT
 from tts import DeepgramTTS, synthesize_http, detect_sentence_boundary
 from semantic import analyze_utterance
 from acoustic import analyze_audio, init_hubert_model
+from ingest import DocumentIngester
 
 load_dotenv()
 
@@ -53,8 +56,15 @@ rag_engine: Optional[RAGEngine] = None
 async def lifespan(app: FastAPI):
     global rag_engine
     rag_engine = RAGEngine()
-    rag_engine.initialize()
-    print("[OK] RAG engine initialized")
+
+    # Phase 4: Ingest documents from knowledge/ directory
+    knowledge_dir = os.path.join(os.path.dirname(__file__), "knowledge")
+    ingester = DocumentIngester()
+    ingested_chunks = ingester.ingest_directory(knowledge_dir)
+
+    # Initialize RAG with ingested docs (falls back to hardcoded FAQs if empty)
+    rag_engine.initialize(external_documents=ingested_chunks if ingested_chunks else None)
+    print(f"[OK] RAG engine initialized ({rag_engine.vector_store.count()} documents)")
 
     # Load HuBERT model onto GPU/CPU (lazy init — won't crash if deps missing)
     init_hubert_model()
@@ -64,9 +74,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="miniVoxSetu", lifespan=lifespan)
 
+# CORS: Restrict to known origins in production. Set ALLOWED_ORIGINS env var
+# as comma-separated list (e.g., "https://yourdomain.com,http://localhost:5173")
+_allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -90,6 +103,10 @@ BANKING COMPLIANCE:
 
 If you receive context from the knowledge base, use it naturally as if you already know this information.
 Never say "according to our records" or "the knowledge base says". Just answer naturally."""
+
+# Maximum conversation turns to keep in context window.
+# Prevents unbounded memory growth and Groq context overflow.
+MAX_HISTORY_TURNS = 20
 
 
 @app.get("/health")
@@ -189,6 +206,46 @@ async def websocket_chat(websocket: WebSocket):
             pass
 
     # --- Lazy Deepgram Connection ---
+    async def trigger_barge_in():
+        nonlocal is_speaking, barged_in, pipeline_generation, current_pipeline_task, current_semantic_task, current_acoustic_task
+
+        if not is_speaking:
+            return
+
+        print("[BARGE-IN] User interrupted (VAD triggered)")
+
+        # B6: Check if the interruption is just a backchannel response
+        latest_transcript = " ".join(stt._final_segments).strip() if stt._final_segments else ""
+        if latest_transcript and is_backchannel(latest_transcript):
+            print(f"[BARGE-IN] B6: Backchannel detected: '{latest_transcript}' — soft pause only")
+            if tts_connected and tts.is_connected():
+                await tts.clear()
+            stt.flush()
+            await asyncio.sleep(0.3)
+            return
+
+        # Full barge-in reset
+        barged_in = True
+        pipeline_generation += 1
+        is_speaking = False
+        stt.flush()
+
+        if tts_connected and tts.is_connected():
+            await tts.clear()
+        if current_pipeline_task and not current_pipeline_task.done():
+            current_pipeline_task.cancel()
+        if current_semantic_task and not current_semantic_task.done():
+            current_semantic_task.cancel()
+        if current_acoustic_task and not current_acoustic_task.done():
+            current_acoustic_task.cancel()
+        acoustic_chunks_this_turn.clear()
+
+        # Tell the frontend to instantly stop playing whatever audio it has queued
+        try:
+            await websocket.send_text(json.dumps({"type": "clear_audio"}))
+        except Exception:
+            pass
+
     async def ensure_stt_connected():
         """Connect to Deepgram lazily (only when audio actually arrives).
         Also handles reconnection if Deepgram dropped."""
@@ -292,10 +349,9 @@ async def websocket_chat(websocket: WebSocket):
             if speculative_rag_cache["query"] and text.startswith(speculative_rag_cache["query"][:20]):
                 return  # Same prefix, cached result is likely still valid
 
-            import time as _time
-            start = _time.time()
+            start = time.time()
             results = rag_engine.retrieve(text, n_results=2)
-            elapsed = round((_time.time() - start) * 1000)
+            elapsed = round((time.time() - start) * 1000)
 
             # Cache the query embedding for similarity comparison later
             query_embedding = rag_engine._embed_query(text)
@@ -416,6 +472,17 @@ async def websocket_chat(websocket: WebSocket):
     async def run_pipeline(user_text: str, turn_id: int, expected_generation: int = -1):
         nonlocal is_speaking, barged_in, speculative_rag_cache
 
+        # Telemetry State (Phase 8)
+        turn_start_time = time.time()
+        telemetry = {
+            "turn_id": turn_id,
+            "stt_ms": 200, # Simulated average STT time since utterance end
+            "rag_ms": 0,
+            "llm_ttft_ms": 0,
+            "tts_first_audio_ms": 0,
+            "total_turn_ms": 0
+        }
+
         # B5: Stale pipeline guard — abort if generation changed since launch
         if expected_generation >= 0 and pipeline_generation != expected_generation:
             print(f"[PIPELINE] Turn {turn_id} skipped (stale generation {expected_generation} != {pipeline_generation})")
@@ -456,9 +523,8 @@ async def websocket_chat(websocket: WebSocket):
                     final_embedding = rag_engine._embed_query(user_text)
                     cached_embedding = speculative_rag_cache["embedding"]
                     # Cosine similarity between final and speculative queries
-                    import numpy as _np
-                    cos_sim = float(_np.dot(final_embedding, cached_embedding) / (
-                        _np.linalg.norm(final_embedding) * _np.linalg.norm(cached_embedding)
+                    cos_sim = float(np.dot(final_embedding, cached_embedding) / (
+                        np.linalg.norm(final_embedding) * np.linalg.norm(cached_embedding)
                     ))
                     if cos_sim > 0.85:
                         rag_chunks = speculative_rag_cache["chunks"]
@@ -468,7 +534,9 @@ async def websocket_chat(websocket: WebSocket):
                         print(f"[RAG] ⚠️ Speculative cache stale (similarity={cos_sim:.3f}), re-querying")
 
                 if not cache_used:
+                    rag_start_time = time.time()
                     results = rag_engine.retrieve(user_text, n_results=2)
+                    telemetry["rag_ms"] = round((time.time() - rag_start_time) * 1000)
                     if results:
                         rag_chunks = results
 
@@ -536,90 +604,113 @@ async def websocket_chat(websocket: WebSocket):
             print(f"[PIPELINE] Calling Groq {GROQ_MODEL} (stream=True)...")
             groq_start = time.time()
             first_token_logged = False
-
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                async with client.stream(
-                    "POST",
-                    GROQ_API_URL,
-                    headers={
-                        "Authorization": f"Bearer {GROQ_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": GROQ_MODEL,
-                        "messages": messages,
-                        "stream": True,
-                        "max_tokens": 512,
-                        "temperature": 0.7,
-                    },
-                ) as response:
-                    if response.status_code != 200:
-                        error_body = await response.aread()
-                        raise Exception(f"Groq API returned {response.status_code}: {error_body.decode()[:300]}")
-
-                    async for line in response.aiter_lines():
-                        # B4: Hard stop if barge-in flag is set
-                        if barged_in:
-                            break
-                        if not is_speaking:
-                            break
-
-                        # SSE format: "data: {...}" or "data: [DONE]"
-                        if not line.startswith("data: "):
-                            continue
-                        payload = line[6:]  # strip "data: " prefix
-                        if payload == "[DONE]":
-                            break
-
-                        try:
-                            chunk_data = json.loads(payload)
-                        except json.JSONDecodeError:
-                            continue
-
-                        delta = chunk_data.get("choices", [{}])[0].get("delta", {})
-                        token_text = delta.get("content", "")
-
-                        if not token_text:
-                            continue
-
-                        if not first_token_logged:
-                            ttft = round((time.time() - groq_start) * 1000)
-                            print(f"[PIPELINE] ⚡ Groq TTFT: {ttft}ms")
-                            first_token_logged = True
-
-                        full_response += token_text
-                        text_buffer += token_text
-
-                        await websocket.send_text(json.dumps({
-                            "type": "chunk",
-                            "text": token_text,
-                        }))
-
-                        sentence, remaining = detect_sentence_boundary(text_buffer)
-                        if sentence:
-                            text_buffer = remaining
-                            # B4: Skip TTS synthesis and send if barged in
-                            if barged_in:
+            
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        async with client.stream(
+                            "POST",
+                            GROQ_API_URL,
+                            headers={
+                                "Authorization": f"Bearer {GROQ_API_KEY}",
+                                "Content-Type": "application/json",
+                            },
+                            json={
+                                "model": GROQ_MODEL,
+                                "messages": messages,
+                                "stream": True,
+                                "max_tokens": 512,
+                                "temperature": 0.7,
+                            },
+                        ) as response:
+                            if response.status_code == 429 and attempt < max_retries - 1:
+                                print(f"[PIPELINE] ⚠️ Groq rate limit hit (429). Retrying {attempt + 1}/{max_retries} in 1s...")
+                                await asyncio.sleep(1.0)
                                 continue
-                            try:
-                                print(f"[TTS] Synthesizing: '{sentence[:60]}...'")
-                                if tts_connected and tts.is_connected():
-                                    audio_bytes = await tts.synthesize(sentence)
-                                else:
-                                    audio_bytes = await synthesize_http(sentence, DEEPGRAM_API_KEY)
-                                # B4: Re-check after async TTS call
+                            elif response.status_code != 200:
+                                error_body = await response.aread()
+                                raise Exception(f"Groq API returned {response.status_code}: {error_body.decode()[:300]}")
+
+                            async for line in response.aiter_lines():
+                                # B4: Hard stop if barge-in flag is set
                                 if barged_in:
+                                    break
+                                if not is_speaking:
+                                    break
+
+                                # SSE format: "data: {...}" or "data: [DONE]"
+                                if not line.startswith("data: "):
                                     continue
-                                print(f"[TTS] ✅ Got {len(audio_bytes)} bytes of audio")
-                                audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+                                payload = line[6:]  # strip "data: " prefix
+                                if payload == "[DONE]":
+                                    break
+
+                                try:
+                                    chunk_data = json.loads(payload)
+                                except json.JSONDecodeError:
+                                    continue
+
+                                delta = chunk_data.get("choices", [{}])[0].get("delta", {})
+                                token_text = delta.get("content", "")
+
+                                if not token_text:
+                                    continue
+
+                                if not first_token_logged:
+                                    ttft = round((time.time() - groq_start) * 1000)
+                                    telemetry["llm_ttft_ms"] = ttft
+                                    print(f"[PIPELINE] ⚡ Groq TTFT: {ttft}ms")
+                                    first_token_logged = True
+
+                                full_response += token_text
+                                text_buffer += token_text
+
                                 await websocket.send_text(json.dumps({
-                                    "type": "audio",
-                                    "data": audio_b64,
-                                    "format": "mp3",
+                                    "type": "chunk",
+                                    "text": token_text,
                                 }))
-                            except Exception as e:
-                                print(f"[TTS] ❌ Error: {e}")
-                                traceback.print_exc()
+
+                                sentence, remaining = detect_sentence_boundary(text_buffer)
+                                if sentence:
+                                    text_buffer = remaining
+                                    # B4: Skip TTS synthesis and send if barged in
+                                    if barged_in:
+                                        continue
+                                    try:
+                                        print(f"[TTS] Synthesizing: '{sentence[:60]}...'")
+                                        if tts_connected and tts.is_connected():
+                                            audio_bytes = await tts.synthesize(sentence)
+                                        else:
+                                            audio_bytes = await synthesize_http(sentence, DEEPGRAM_API_KEY)
+                                        # B4: Re-check after async TTS call
+                                        if barged_in:
+                                            continue
+                                        print(f"[TTS] ✅ Got {len(audio_bytes)} bytes of audio")
+                                        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+                                        
+                                        if telemetry["tts_first_audio_ms"] == 0:
+                                            telemetry["tts_first_audio_ms"] = round((time.time() - turn_start_time) * 1000)
+
+                                        await websocket.send_text(json.dumps({
+                                            "type": "audio",
+                                            "data": audio_b64,
+                                            "format": "mp3",
+                                        }))
+                                    except Exception as e:
+                                        print(f"[TTS] ❌ Error: {e}")
+                                        traceback.print_exc()
+
+                    # Successful stream without errors/retries, exit retry loop
+                    break
+
+                except Exception as stream_err:
+                    if "429" in str(stream_err) and attempt < max_retries - 1:
+                        print(f"[PIPELINE] ⚠️ Groq rate limit hit via exception. Retrying {attempt + 1}/{max_retries} in 1s...")
+                        await asyncio.sleep(1.0)
+                        continue
+                    # Reraise if it's not a rate limit or we're out of retries
+                    raise stream_err
 
             # TTS remaining buffer
             if text_buffer.strip() and is_speaking and not barged_in:
@@ -644,9 +735,21 @@ async def websocket_chat(websocket: WebSocket):
             conversation_history.append({"role": "user", "content": user_text})
             conversation_history.append({"role": "assistant", "content": full_response})
 
+            # Conversation history windowing: keep only last N turns
+            # to prevent unbounded memory growth and Groq context overflow
+            if len(conversation_history) > MAX_HISTORY_TURNS * 2:
+                conversation_history[:] = conversation_history[-(MAX_HISTORY_TURNS * 2):]
+
             await websocket.send_text(json.dumps({
                 "type": "done",
                 "full_text": full_response,
+            }))
+
+            # Send Telemetry (Phase 8)
+            telemetry["total_turn_ms"] = round((time.time() - turn_start_time) * 1000)
+            await websocket.send_text(json.dumps({
+                "type": "telemetry",
+                "data": telemetry
             }))
 
             is_speaking = False
@@ -734,42 +837,7 @@ async def websocket_chat(websocket: WebSocket):
                 msg_type = data.get("type", "")
 
                 if msg_type == "barge_in":
-                    print("[BARGE-IN] User interrupted")
-
-                    # B6: Check if the interruption is just a backchannel response
-                    latest_transcript = " ".join(stt._final_segments).strip() if stt._final_segments else ""
-                    if latest_transcript and is_backchannel(latest_transcript):
-                        print(f"[BARGE-IN] B6: Backchannel detected: '{latest_transcript}' — soft pause only")
-                        # Soft pause: stop current audio but don't kill the pipeline
-                        if tts_connected and tts.is_connected():
-                            await tts.clear()
-                        stt.flush()
-                        # Don't cancel pipeline, don't increment generation, don't set barged_in
-                        # The pipeline will continue generating and sending the next sentence
-                        await asyncio.sleep(0.3)  # 300ms pause for natural rhythm
-                        continue
-
-                    # Full barge-in reset (not backchannel)
-                    # B4: Set barge-in gate FIRST — blocks in-flight sends
-                    barged_in = True
-                    # B5: Increment generation counter — invalidates any in-flight pipeline
-                    pipeline_generation += 1
-                    is_speaking = False
-                    stt.flush()
-                    # Clear TTS buffer server-side (stops pending audio)
-                    if tts_connected and tts.is_connected():
-                        await tts.clear()
-                    # Cancel main pipeline
-                    if current_pipeline_task and not current_pipeline_task.done():
-                        current_pipeline_task.cancel()
-                    # Cancel semantic analysis (incomplete analysis is worthless)
-                    if current_semantic_task and not current_semantic_task.done():
-                        current_semantic_task.cancel()
-                    # Cancel in-progress acoustic analysis
-                    if current_acoustic_task and not current_acoustic_task.done():
-                        current_acoustic_task.cancel()
-                    # Clear acoustic buffer for this turn
-                    acoustic_chunks_this_turn.clear()
+                    await trigger_barge_in()
 
                 elif msg_type == "acoustic_pcm":
                     # Raw PCM audio from AudioWorklet (every 1.5s)
@@ -819,7 +887,6 @@ async def websocket_chat(websocket: WebSocket):
                     print(f"[SESSION] End call requested, generating report for {len(turn_log)} turns...")
                     if turn_log:
                         try:
-                            import datetime
                             os.makedirs("reports", exist_ok=True)
 
                             log_text = ""

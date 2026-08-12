@@ -1,7 +1,15 @@
 # acoustic.py
 # Processes raw Float32 PCM audio to extract physics-based and ML-based features.
 # Runs on a ThreadPoolExecutor to prevent blocking FastAPI's main event loop.
+#
+# Production Optimizations (Phase 1):
+#   - RAM guard: skips HuBERT if system has < 1.5GB free memory
+#   - INT8 dynamic quantization: ~50% memory reduction on linear layers
+#   - torch.inference_mode(): faster than no_grad() on CPU
+#   - Thread tuning: torch.set_num_threads(2) for constrained cloud hosts
 
+import gc
+import os
 import numpy as np
 import base64
 import asyncio
@@ -25,25 +33,89 @@ executor = ThreadPoolExecutor(max_workers=1)
 # Device configuration — guarded so we don't crash if torch isn't installed
 if DEPS_AVAILABLE:
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[ACOUSTIC] PyTorch device: {device}")
+    # Constrain CPU threads for cloud containers with limited cores
+    if device == "cpu":
+        _num_threads = int(os.getenv("ACOUSTIC_NUM_THREADS", "2"))
+        torch.set_num_threads(_num_threads)
+        torch.set_num_interop_threads(1)
+        print(f"[ACOUSTIC] PyTorch device: {device} (threads={_num_threads})")
+    else:
+        print(f"[ACOUSTIC] PyTorch device: {device}")
 else:
     device = "cpu"
 model = None
 processor = None
 
+# Minimum system RAM required to load HuBERT (prevents OOM on small instances).
+# NOTE: If testing locally with a GPU, you can set this to 0.0 to bypass the check,
+# and install CUDA-enabled PyTorch (pip install torch torchvision torchaudio).
+ACOUSTIC_MIN_RAM_GB = float(os.getenv("ACOUSTIC_MIN_RAM_GB", "1.5"))
+
+
+def _get_free_ram_gb() -> float:
+    """Get available system RAM in GB. Cross-platform."""
+    try:
+        import psutil
+        return psutil.virtual_memory().available / (1024 ** 3)
+    except ImportError:
+        # psutil not installed — try reading from /proc (Linux)
+        try:
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) / (1024 ** 2)  # KB → GB
+        except (FileNotFoundError, Exception):
+            pass
+    # Can't determine RAM — assume enough to proceed
+    return 99.0
+
+
 def init_hubert_model():
-    """Lazy initializer for HuBERT model to save startup memory if CUDA isn't verified yet."""
+    """
+    Lazy initializer for HuBERT model with production safeguards:
+    1. RAM check — skips loading if insufficient memory (prevents OOM on free cloud tiers)
+    2. INT8 dynamic quantization — reduces memory ~50% on CPU
+    3. gc.collect() — reclaims transient allocation overhead
+    """
     global model, processor, DEPS_AVAILABLE
     if not DEPS_AVAILABLE:
         return
+
+    # RAM guard: prevent OOM on low-memory cloud containers
+    free_ram = _get_free_ram_gb()
+    if free_ram < ACOUSTIC_MIN_RAM_GB:
+        print(f"[ACOUSTIC] ⚠️ Skipping HuBERT model — only {free_ram:.1f}GB RAM free "
+              f"(need {ACOUSTIC_MIN_RAM_GB}GB). Using Librosa physics-only mode.")
+        return
+
     try:
-        print(f"Loading superb/hubert-base-superb-er onto {device}...")
+        print(f"[ACOUSTIC] Loading superb/hubert-base-superb-er onto {device} "
+              f"(free RAM: {free_ram:.1f}GB)...")
         processor = Wav2Vec2FeatureExtractor.from_pretrained("superb/hubert-base-superb-er")
         model = HubertForSequenceClassification.from_pretrained("superb/hubert-base-superb-er").to(device)
         model.eval()
-        print("HuBERT model loaded successfully.")
+
+        # INT8 dynamic quantization for CPU — quantizes Linear layers to int8
+        # reducing memory ~50% and improving inference speed ~30% on CPU
+        if device == "cpu":
+            try:
+                model = torch.quantization.quantize_dynamic(
+                    model,
+                    {torch.nn.Linear},
+                    dtype=torch.qint8
+                )
+                print("[ACOUSTIC] ✅ INT8 dynamic quantization applied to HuBERT (CPU)")
+            except Exception as quant_err:
+                print(f"[ACOUSTIC] ⚠️ Quantization failed (non-fatal, using FP32): {quant_err}")
+
+        # Force garbage collection to reclaim transient allocations from model loading
+        gc.collect()
+        if DEPS_AVAILABLE and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        print("[ACOUSTIC] ✅ HuBERT model loaded successfully.")
     except Exception as e:
-        print(f"Failed to load HuBERT model: {e}")
+        print(f"[ACOUSTIC] ❌ Failed to load HuBERT model: {e}")
         traceback.print_exc()
 
 def sync_analyze_audio(pcm_array: np.ndarray, sr: int, interrupted: bool) -> dict:
@@ -114,7 +186,7 @@ def sync_analyze_audio(pcm_array: np.ndarray, sr: int, interrupted: bool) -> dic
                 inputs = processor(audio_16k, sampling_rate=16000, return_tensors="pt")
                 inputs = {k: v.to(device) for k, v in inputs.items()}
                 
-                with torch.no_grad():
+                with torch.inference_mode():
                     logits = model(**inputs).logits
                     probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
                 

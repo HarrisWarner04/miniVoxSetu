@@ -1,8 +1,7 @@
 # miniVoxSetu
+**A Production-Grade Voice AI Pipeline MVP**
 
-**Production-Grade Voice AI Pipeline MVP**
-
-A fully-featured, server-driven voice AI agent that demonstrates enterprise voice architectures — streaming audio forking, multi-modal intelligence fusion, sub-200ms barge-in, speculative RAG, and automated post-call QA — built with React + FastAPI over a single WebSocket.
+miniVoxSetu is a fully-featured, server-driven voice AI agent that demonstrates enterprise voice architectures. It features streaming audio forking, multi-modal intelligence fusion, sub-300ms barge-in detection, speculative RAG, and automated post-call QA—all built with React and FastAPI running over a single WebSocket connection.
 
 > **Who is this for?**
 > Engineers, solution architects, and tech leads who want to understand how production voice AI systems (like those built on FreeSWITCH, Genesys, or Amazon Connect) actually work — without the vendor lock-in. Every architectural decision is documented in code comments and in this README.
@@ -10,7 +9,7 @@ A fully-featured, server-driven voice AI agent that demonstrates enterprise voic
 ---
 
 ## Table of Contents
-
+- [🌟 Core Features](#-core-features)
 - [High-Level Architecture](#high-level-architecture)
 - [System Architecture Diagram](#system-architecture-diagram)
 - [The Three Intelligence Layers](#the-three-intelligence-layers)
@@ -35,15 +34,22 @@ A fully-featured, server-driven voice AI agent that demonstrates enterprise voic
 - [Latency Budget](#latency-budget)
 - [Enterprise Edge Cases Handled](#enterprise-edge-cases-handled)
 - [Production Upgrade Path](#production-upgrade-path)
+- [Deep Dive Documentation](#deep-dive-documentation)
 - [FAQ](#faq)
 
+## 🌟 Core Features
+
+- **Blazing Fast Latency**: ~100ms LLM Time-To-First-Token (via Groq LLaMA 3.3) and Cascaded TTS streaming.
+- **7-Layer Barge-In System**: Detects interruptions in <300ms and elegantly handles conversational backchannels ("uh-huh").
+- **Speculative RAG**: Predicts and runs vector searches *while* the user is still speaking to eliminate database latency.
+- **Tri-Layer Intelligence**: 
+  - **Generative** (LLaMA 3.3)
+  - **Semantic** (Gemini 2.5 Flash for background intent and sentiment analysis)
+  - **Acoustic** (HuBERT / Librosa for voice stress and emotion detection)
+- **PII Redaction**: Regex-based sanitation scrubbed before hitting external APIs.
 ---
-
-## High-Level Architecture
-
-miniVoxSetu implements a **Server-Driven Intelligence** pattern. The browser is a thin audio transport layer — all intelligence (STT, LLM, TTS, NLU, emotion detection) runs on the backend. This mirrors how production contact center platforms work, where the telephony edge (browser/SBC/FreeSWITCH) captures audio and the intelligence stack runs server-side.
-
-```
+## 🏗️ System Architecture
+miniVoxSetu implements a **Server-Driven Intelligence** pattern, mirroring production contact center architectures (e.g., FreeSWITCH, Twilio SIP). The browser serves merely as a thin audio transport layer.
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                          BROWSER (Thin Client)                        │
 │                                                                       │
@@ -87,12 +93,9 @@ miniVoxSetu implements a **Server-Driven Intelligence** pattern. The browser is 
 │                    └─────────────────────┘                            │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
-
 ---
-
-## System Architecture Diagram
-
-```
+## 🔄 End-to-End Data Flow
+The conversation loop is heavily parallelized for minimal latency.
                     ┌─────────────────────────────────────────────────┐
                     │              BROWSER (React + Vite)             │
                     │                                                 │
@@ -222,17 +225,11 @@ miniVoxSetu implements a **Server-Driven Intelligence** pattern. The browser is 
                     │           └─────────────────┘                    │
                     └──────────────────────────────────────────────────┘
 ```
-
 ---
-
 ## The Three Intelligence Layers
-
 miniVoxSetu implements a **tri-layer intelligence architecture**. Each layer runs independently and their outputs are fused for decision-making.
-
 ### Layer 1 — Main Generative Pipeline (`main.py`)
-
 The core conversational loop. This is the **latency-critical path** — every millisecond matters here because the user is waiting for a response.
-
 | Step | Module | What Happens | Latency |
 |------|--------|-------------|---------|
 | 1 | `pii.py` | Regex-based PII redaction (Aadhaar, PAN, card, phone, email, IFSC, account) | <1ms |
@@ -240,15 +237,10 @@ The core conversational loop. This is the **latency-critical path** — every mi
 | 3 | `main.py` | Build enhanced system prompt: base + RAG chunks + semantic context (N-1) + acoustic context (N-1) | <1ms |
 | 4 | Groq API | Stream LLM response from LLaMA 3.3 70B via SSE | ~100ms TTFT |
 | 5 | `tts.py` | Sentence boundary detection → Deepgram Aura TTS (persistent WebSocket) → base64 MP3 to browser | ~150ms per sentence |
-
 **Why Groq for LLM?** Groq's LPU hardware delivers ~100ms TTFT vs Gemini's ~400ms. Since the user is waiting on a phone call, TTFT directly impacts perceived responsiveness. Gemini is still used for non-latency-critical tasks (semantic analysis, report generation).
-
 **Cascaded TTS**: The LLM streams tokens. As soon as a sentence boundary is detected (`.`, `!`, `?` — with abbreviation and decimal guards), that sentence is sent to TTS *while the LLM is still generating the next sentence*. This overlaps LLM generation with TTS synthesis, saving ~150ms per sentence.
-
 ### Layer 2 — Semantic Intelligence (`semantic.py`)
-
 Runs **in parallel** with the main pipeline (not blocking it). Analyzes the user's complete utterance using Gemini 2.5 Flash with structured JSON output.
-
 **Output Schema:**
 ```json
 {
@@ -261,16 +253,11 @@ Runs **in parallel** with the main pipeline (not blocking it). Analyzes the user
   "recommended_tone": "empathetic | professional | reassuring | apologetic | cheerful"
 }
 ```
-
 **One-Turn-Behind Injection**: Semantic results from turn N are injected into the system prompt for turn N+1. This allows the agent to adapt its tone based on the customer's emotional state without blocking the current turn.
-
 ### Layer 3 — Acoustic Intelligence (`acoustic.py`)
-
 A **dual-path audio processor** that runs on a `ThreadPoolExecutor` to avoid blocking the asyncio event loop.
-
 #### Path A — Signal Processing (librosa)
 Extracts physics-based features from raw PCM audio:
-
 | Feature | What It Measures | Why It Matters |
 |---------|-----------------|----------------|
 | **F0 Pitch** (pYIN algorithm) | Fundamental frequency (60–400 Hz) | Elevated pitch (>250 Hz) indicates frustration or agitation |
@@ -278,49 +265,38 @@ Extracts physics-based features from raw PCM audio:
 | **ZCR** | Zero-crossing rate | Harsh/tense voice has high ZCR (>0.15) |
 | **Spectral Centroid** | Brightness/timbre | High centroid (>3500 Hz) indicates sharp, tense speech |
 | **Energy Variance** | Volume consistency | Erratic volume suggests emotional instability |
-
 #### Path B — ML Inference (HuBERT)
 Uses the `superb/hubert-base-superb-er` model fine-tuned on the IEMOCAP dataset for emotion recognition:
-
 | Label | Description |
 |-------|-------------|
 | `neutral` | Calm, informational speech |
 | `happy` | Positive, satisfied |
 | `angry` | Frustrated, aggressive |
 | `sad` | Disappointed, resigned |
-
 #### Fusion Layer
 Physics and ML outputs are combined with a **50/50 weighted fusion**:
-
 ```
 stress_score = (physics_stress × 0.5) + (model_stress × 0.5)
-
 where:
   physics_stress = (normalized_pitch × 0.4) + (normalized_volume × 0.4) + (zcr_stress × 0.2)
   model_stress   = (P(angry) × 1.0) + (P(sad) × 0.5)
 ```
-
 **Why 50/50?** HuBERT on short, noisy browser audio clips tends to bias toward `neutral`. Physics features provide a reliable secondary signal that catches cases the ML model misses.
-
 #### Physics Override Rules
 When the ML model outputs `neutral` but physics disagree, the system overrides:
-
 | Rule | Condition | Override To |
 |------|-----------|-------------|
 | **Shouting** | `neutral` + RMS > -22 dB | `agitated`, stress ≥ 55% |
 | **High Pitch** | `neutral` + F0 > 250 Hz + RMS > -28 dB | `agitated`, stress ≥ 45% |
 | **Harsh Voice** | `neutral` + spectral centroid > 3500 Hz + RMS > -30 dB | `agitated`, stress ≥ 40% |
 | **Whisper-Angry** | `angry` + RMS < -35 dB | `agitated_whisper` |
-
 #### Simulation Mode
 If PyTorch, librosa, or transformers fail to import (common on Windows without CUDA), the acoustic layer falls back to **simulation mode** — generating realistic mock values so the entire pipeline continues to work without crashing.
-
 ---
-
 ## Audio Forking Architecture
-
+## 📚 Deep Dive Documentation
 In production telephony (e.g., FreeSWITCH), RTP audio is "forked" — duplicated into multiple WebSocket streams so that STT and other processors receive independent copies of the same audio. miniVoxSetu emulates this pattern using the browser's `AudioWorklet` API.
-
+For a detailed breakdown of how to launch, evaluate, and scale this project, refer to the following documentation files:
 ```
                 getUserMedia (48kHz, mono)
                         │
@@ -351,23 +327,34 @@ In production telephony (e.g., FreeSWITCH), RTP audio is "forked" — duplicated
               │  └──────────────────┘  │
               └────────────────────────┘
 ```
-
+- 🚀 **[Deployment Guide](DEPLOYMENT.md)**: How to run this stack locally and deploy it to Oracle Cloud and Vercel.
+- 🏢 **[MVP vs. Production](MVP_VS_PRODUCTION.md)**: Architectural roadmap from this MVP to a million-user enterprise deployment (WavLM, Contextual ML, Relay Transceivers).
+- 📊 **[Evaluation Guide](EVALUATION.md)**: How we test non-deterministic AI pipelines (RAG Precision, PII Accuracy, Latency).
 **Why AudioWorklet instead of MediaRecorder?**
 - `MediaRecorder` outputs WebM/Opus containers, which Deepgram's streaming API can struggle with
 - `AudioWorklet` runs on a dedicated thread with real-time priority, providing precise sample-level control
 - We can output both Int16 (for STT) and Float32 (for acoustic analysis) from the same source without re-encoding
-
 ---
-
 ## Data Flow — End to End
-
+## 🚀 Quick Start (Local)
 Here is the complete lifecycle of a single conversational turn:
-
+1. Rename `backend/.env.example` to `backend/.env` and add your API keys.
+2. Ensure you have Docker running.
+3. Start the backend:
+   ```bash
+   docker-compose up -d
+   ```
+4. Start the frontend:
+   ```bash
+   cd frontend
+   npm install
+   npm run dev
+   ```
+5. Open `http://localhost:5173` and click the microphone.
 ```
 Time ──────────────────────────────────────────────────────────────────→
-
+> Note: To test the Acoustic Layer fully, ensure you have python `torch` and `librosa` installed locally.
 User speaks: "What is my account balance?"
-
  ┌─ Browser ─────────────────────────────────────────────────────────┐
  │                                                                   │
  │  1. AudioWorklet captures 48kHz mono PCM                          │
@@ -422,15 +409,10 @@ User speaks: "What is my account balance?"
  │                                                                   │
  └───────────────────────────────────────────────────────────────────┘
 ```
-
 ---
-
 ## WebSocket Protocol Reference
-
 A single WebSocket connection (`ws://localhost:8000/ws/chat`) carries all communication. The protocol multiplexes binary audio and JSON control messages.
-
 ### Client → Server
-
 | Frame Type | Message Type | Payload | Description |
 |-----------|-------------|---------|-------------|
 | **Binary** | — | Raw Int16 PCM bytes | Audio for STT (100ms chunks from AudioWorklet) |
@@ -438,9 +420,7 @@ A single WebSocket connection (`ws://localhost:8000/ws/chat`) carries all commun
 | Text/JSON | `barge_in` | `{}` | User interrupted — cancel all in-flight tasks |
 | Text/JSON | `text_input` | `{text: str, history: [...]}` | Text fallback input (bypasses STT) |
 | Text/JSON | `end_call` | `{}` | Session end — triggers post-call report generation |
-
 ### Server → Client
-
 | Message Type | Payload | Description |
 |-------------|---------|-------------|
 | `transcript` | `{text, is_final, confidence}` | Live STT from Deepgram (interim + final) |
@@ -453,13 +433,9 @@ A single WebSocket connection (`ws://localhost:8000/ws/chat`) carries all commun
 | `acoustic` | `{data: {...}, latency_ms}` | Acoustic analysis results |
 | `report` | `{data: str, turns: int}` | Markdown post-call QA report |
 | `error` | `{message: str}` | Error notification |
-
 ---
-
 ## Barge-In System (B1–B7)
-
 Barge-in (user interruption) is the hardest problem in voice AI. miniVoxSetu implements a **7-layer barge-in system**:
-
 | Layer | Name | What It Does |
 |-------|------|-------------|
 | **B1** | Dynamic Threshold Calibration | On mic start, 500ms of ambient noise is sampled. VAD threshold = max(0.01, baseline × 2.5). Prevents false triggers in noisy environments. |
@@ -469,12 +445,9 @@ Barge-in (user interruption) is the hardest problem in voice AI. miniVoxSetu imp
 | **B5** | Generation Counter | A monotonic `pipeline_generation` counter. Incremented on every barge-in. Any pipeline task launched with an old generation number is silently discarded at multiple checkpoints (before PII, before RAG, before LLM, before TTS send). |
 | **B6** | Backchannel Detection | Short utterances like "uh-huh", "okay", "hmm", "accha" are detected as backchannel (not real interruptions). The agent pauses 300ms for natural rhythm but does NOT kill the pipeline. Supports Hindi backchannels. |
 | **B7** | Client-Side Audio Queue Drain | On barge-in, the browser immediately: (1) stops the current AudioBufferSourceNode, (2) clears the audio queue, (3) sets a `bargedInRef` flag that prevents any late-arriving audio from being enqueued or played. |
-
 ### Barge-In Sequence Diagram
-
 ```
 User starts speaking over the agent:
-
 Browser (AudioWorklet)                    Backend (FastAPI)
         │                                       │
         │ ← Agent is SPEAKING →                 │
@@ -506,18 +479,12 @@ Browser (AudioWorklet)                    Backend (FastAPI)
   New pipeline starts with                      │
   incremented generation number                 │
 ```
-
 ---
-
 ## Speculative RAG Pipeline
-
 Standard RAG adds ~5ms to the critical path (embed query + search). Speculative RAG eliminates this by running the RAG query **before the user finishes speaking**.
-
 ```
 Time ──────────────────────────────────────────────────────────→
-
 User speaking: "What are your fixed deposit rates?"
-
   Deepgram interim (conf=0.4): "What are"        → No action (< 0.7)
   Deepgram interim (conf=0.7): "What are your"    → Skip (< 3 words)
   Deepgram interim (conf=0.8): "What are your fixed" → SPECULATIVE RAG FIRES
@@ -537,31 +504,23 @@ User speaking: "What are your fixed deposit rates?"
                                                          │
   Result: RAG latency reduced from ~5ms to ~1ms (embedding comparison only)
 ```
-
 **Cache invalidation**: If `cos_sim ≤ 0.85` (the user changed topics mid-sentence), the speculative cache is discarded and a fresh RAG query runs.
-
 ---
-
 ## RAG Engine Deep Dive
-
 ### Embedding Model
 - **Model**: `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions)
 - **Runs locally** on CPU — no API calls needed
 - **Embedding latency**: ~5ms per query (vs ~150ms for Gemini Embedding API)
 - **Why local?** Eliminates network round-trip. In a voice pipeline, every 150ms matters.
-
 ### Vector Store
 `SimpleVectorStore` — a minimal in-memory implementation that mirrors ChromaDB's interface:
-
 ```python
 class SimpleVectorStore:
     def add(ids, embeddings, documents)     # Index phase (startup)
     def query(query_embedding, n_results)   # Retrieval phase (per query)
     def count()                             # Number of indexed documents
 ```
-
 **Search algorithm**: Brute-force cosine similarity (O(n) where n = number of documents). In production with millions of docs, this would use HNSW approximate nearest neighbor (as ChromaDB uses internally via hnswlib).
-
 ### Knowledge Base
 21 hardcoded FAQ documents covering NeoBank's product catalog:
 - Account types (Basic, Premium, Current)
@@ -572,17 +531,11 @@ class SimpleVectorStore:
 - KYC, complaints, customer support
 - International transactions, overdraft, cheque books
 - Tax/TDS rules
-
 **Production upgrade**: Replace hardcoded FAQ with a CMS-backed document store. Replace `SimpleVectorStore` with ChromaDB/Pinecone/pgvector. Add document chunking for longer documents.
-
 ---
-
 ## PII Redaction Layer
-
 All user speech is scrubbed of personally identifiable information **before** being sent to any LLM API (Groq, Gemini). This is a compliance requirement for financial services.
-
 ### Patterns Detected (in priority order)
-
 | Pattern | Regex | Replacement Token | Example |
 |---------|-------|--------------------|---------|
 | Credit/Debit Card | 16 digits (grouped by 4) | `[CARD_NO]` | `4111 1111 1111 1111` |
@@ -592,49 +545,33 @@ All user speech is scrubbed of personally identifiable information **before** be
 | Email | Standard email regex | `[EMAIL]` | `user@neobank.in` |
 | IFSC Code | 4 letters + 0 + 6 alphanumeric | `[IFSC]` | `HDFC0001234` |
 | Bank Account | 8–18 digits (generic, last priority) | `[ACCOUNT_NO]` | `00123456789` |
-
 **Pattern order matters**: Credit card (16 digits) is matched before Aadhaar (12 digits) to prevent partial matches.
-
 **Production upgrade path**: Replace regex patterns with [Microsoft Presidio](https://github.com/microsoft/presidio) for ML-based PII detection that handles natural language variations.
-
 ---
-
 ## TTS Cascaded Streaming
-
 miniVoxSetu uses **Deepgram Aura TTS** via a persistent WebSocket connection (one per session), with HTTP fallback.
-
 ### WebSocket Protocol (Deepgram Aura)
-
 ```
 Client → Server:
   {"type": "Speak", "text": "Hello, how can I help?"}  → Start synthesis
   {"type": "Flush"}                                     → Force buffered audio out
   {"type": "Clear"}                                     → Discard buffer (barge-in)
   {"type": "Close"}                                     → Graceful disconnect
-
 Server → Client:
   Binary frames           → MP3 audio chunks
   {"type": "Flushed"}     → All audio for current Speak sent (sentinel)
   {"type": "Warning"}     → Non-fatal warning
   {"type": "Error"}       → Error
 ```
-
 ### Sentence Boundary Detection (`tts.py`)
-
 The `detect_sentence_boundary()` function splits streaming LLM text at sentence boundaries, with smart guards:
-
 - **Abbreviation guard**: Won't split on `Mr.`, `Mrs.`, `Dr.`, `Rs.`, `No.`, `St.`, `etc.`
 - **Decimal guard**: Won't split on `₹1.5` or `3.14`
 - **Minimum length**: Requires at least 3 characters before a boundary (so `OK.` still triggers)
-
 This enables **cascaded streaming**: Sentence 1 is sent to TTS while the LLM is still generating Sentence 2.
-
 ---
-
 ## Post-Call QA Report Generation
-
 When the user clicks "End Call" or disconnects:
-
 1. **Frontend** sends `{type: "end_call"}`
 2. **Backend** compiles the `turn_log` — an array of all turns with:
    - User utterance (PII-redacted)
@@ -649,13 +586,9 @@ When the user clicks "End Call" or disconnects:
    - Action Items / Follow-ups
 4. Report is saved to `backend/reports/post_call_report_YYYYMMDD_HHMMSS.md`
 5. Report is sent to the frontend via WebSocket for modal display
-
 ---
-
 ## Combined Risk Signal & Escalation
-
 The system fuses acoustic and semantic signals to make escalation decisions:
-
 ```
 IF (avg_acoustic_stress_this_turn > 0.6)
    AND (semantic_sentiment < -0.3)
@@ -663,22 +596,16 @@ THEN
    escalation_recommended = true   // Override semantic layer
    combined_risk = true            // Flag in turn log
 ```
-
 This **cross-modal validation** prevents false positives:
 - A user speaking loudly in a noisy environment (high acoustic stress) but asking a neutral question (positive sentiment) → **no escalation**
 - A user with elevated pitch and volume (high acoustic stress) AND expressing frustration (negative sentiment) → **escalate**
-
 ---
-
 ## Frontend Architecture
-
 ### Technology
 - **React 19** (no router — single-page application)
 - **Vite 6** (dev server with WebSocket proxy)
 - **Vanilla CSS** (dark theme, Inter + JetBrains Mono fonts)
-
 ### State Machine
-
 ```
            startRecording()
   IDLE ─────────────────────→ LISTENING
@@ -693,18 +620,14 @@ This **cross-modal validation** prevents false positives:
                                  │
                      handleBargeIn() → back to LISTENING
 ```
-
 ### Key Components
-
 | Component | Purpose |
 |-----------|---------|
 | `useWebSocket` hook | Custom hook managing the WebSocket connection with auto-reconnect, binary+text frame support |
 | AudioWorklet (`pcm-processor.js`) | Runs on dedicated audio thread: STT fork, Acoustic fork, VAD barge-in detection |
 | Audio Playback Queue | `audioQueueRef` — FIFO queue of MP3 chunks decoded via `AudioContext.decodeAudioData` |
 | Dashboard Panels | Live Transcript, Semantic Intelligence, Acoustic Intelligence, RAG Context, Conversation History, Post-Call Report |
-
 ### Dashboard Panels
-
 | Panel | Data Source | Update Frequency |
 |-------|------------|-------------------|
 | **Live Transcript** | Deepgram STT (interim + final) | Real-time (per word) |
@@ -713,11 +636,8 @@ This **cross-modal validation** prevents false positives:
 | **RAG Context** | Local vector search | Per utterance |
 | **Context Window** | Conversation history | Per completed turn |
 | **Post-Call Report** | Gemini 2.5 Flash | On session end |
-
 ---
-
 ## Project Structure
-
 ```
 miniVoxSetu/
 ├── README.md                          # This file
@@ -763,13 +683,9 @@ miniVoxSetu/
     ├── production_stack_decisions.md
     └── ... (additional deep-dive docs)
 ```
-
 ---
-
 ## Technology Stack
-
 ### Backend
-
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
 | **Web Framework** | FastAPI 0.115 + uvicorn 0.34 | Async WebSocket server |
@@ -786,9 +702,7 @@ miniVoxSetu/
 | **PII** | Python `re` (regex) | 7 Indian data patterns |
 | **Config** | python-dotenv | `.env` file loading |
 | **Math** | numpy 2.2 | Cosine similarity, audio processing |
-
 ### Frontend
-
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
 | **UI Framework** | React 19 | Single-page application |
@@ -797,89 +711,60 @@ miniVoxSetu/
 | **Audio Playback** | AudioContext + AudioBufferSourceNode | MP3 decoding and playback |
 | **Styling** | Vanilla CSS | Dark theme, Inter font |
 | **Typography** | Inter (UI) + JetBrains Mono (code) | Google Fonts |
-
 ---
-
 ## Setup & Running
-
 ### Prerequisites
 - **Python 3.10+** with pip
 - **Node.js 18+** with npm
 - API keys for: Deepgram, Groq, Google Gemini
-
 ### 1. Clone the Repository
-
 ```bash
 git clone https://github.com/HarrisWarner04/miniVoxSetu.git
 cd miniVoxSetu
 ```
-
 ### 2. Environment Variables
-
 Create a `.env` file in the `backend/` directory:
-
 ```env
 # Required — Get from https://console.deepgram.com
 DEEPGRAM_API_KEY=your_deepgram_api_key
-
 # Required — Get from https://console.groq.com
 GROQ_API_KEY=your_groq_api_key
-
 # Required — Get from https://aistudio.google.com/app/apikey
 GEMINI_API_KEY=your_gemini_api_key
 ```
-
 ### 3. Backend Setup
-
 ```bash
 cd backend
 python -m venv .venv
-
 # Windows
 .venv\Scripts\activate
 # macOS/Linux
 source .venv/bin/activate
-
 pip install -r requirements.txt
 python main.py
 ```
-
 The backend starts on `http://localhost:8000`.
-
 > **Note**: On first run, the HuBERT model (~360MB) and sentence-transformers model (~80MB) will be downloaded. If `torch` or `librosa` fails to install (common on Windows ARM), the acoustic layer automatically falls back to **simulation mode** — the rest of the pipeline works normally.
-
 ### 4. Frontend Setup
-
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
-
 The frontend starts on `http://localhost:5173`.
-
 ### 5. Open in Browser
-
 Navigate to [http://localhost:5173](http://localhost:5173). Click the mic button to start a voice session.
-
 > **Important**: Use Chrome or Edge. Safari has limited AudioWorklet support. Firefox works but may have echo cancellation issues.
-
 ---
-
 ## Environment Variables
-
 | Variable | Required | Used By | Description |
 |----------|----------|---------|-------------|
 | `DEEPGRAM_API_KEY` | ✅ | `stt.py`, `tts.py` | Deepgram API key for STT (Nova-2) and TTS (Aura) |
 | `GROQ_API_KEY` | ✅ | `main.py` | Groq API key for LLaMA 3.3 70B (latency-critical LLM) |
 | `GEMINI_API_KEY` | ✅ | `semantic.py`, `main.py` | Google Gemini API key for semantic analysis and post-call reports |
-
 ---
-
 ## Latency Budget
-
 Target: **< 1 second** from user stops speaking to first audio playback.
-
 | Stage | Target | Actual | Notes |
 |-------|--------|--------|-------|
 | STT (utterance detection) | < 300ms | ~200ms | Hybrid trigger: `speech_final` + confidence ≥ 0.9 bypasses 1000ms `utterance_end_ms` wait |
@@ -890,11 +775,8 @@ Target: **< 1 second** from user stops speaking to first audio playback.
 | TTS Synthesis | < 200ms | ~150ms | Persistent WebSocket eliminates connection overhead |
 | Audio Delivery | < 50ms | ~30ms | Base64 JSON over existing WebSocket |
 | **Total** | **< 800ms** | **~490ms** | Cascaded TTS overlaps with LLM generation |
-
 ---
-
 ## Enterprise Edge Cases Handled
-
 | Feature | How It's Handled |
 |---------|-----------------|
 | **Barge-in / Interruption** | 7-layer system (B1–B7): AudioWorklet VAD at 2.7ms resolution, server-side generation counter, backchannel detection (Hindi + English), client-side audio queue drain |
@@ -911,13 +793,9 @@ Target: **< 1 second** from user stops speaking to first audio playback.
 | **Echo Cancellation** | Browser AEC + 200ms TTS suppression window prevent the agent's own voice from triggering barge-in |
 | **Lazy Initialization** | Deepgram STT and TTS WebSocket connections are only opened when first needed (not on page load), preventing timeout errors |
 | **Graceful Shutdown** | On disconnect: all asyncio tasks are cancelled, both Deepgram WebSockets are closed, media streams are stopped |
-
 ---
-
 ## Production Upgrade Path
-
 This MVP is designed to be upgraded incrementally to a production system. Here's the mapping:
-
 | MVP Component | Production Equivalent |
 |--------------|----------------------|
 | `SimpleVectorStore` (in-memory) | ChromaDB / Pinecone / pgvector |
@@ -931,34 +809,34 @@ This MVP is designed to be upgraded incrementally to a production system. Here's
 | File-based reports | Database + analytics dashboard |
 | Groq (cloud) | Self-hosted vLLM on GPU cluster |
 | Hardcoded system prompt | Prompt management system (versioned, A/B tested) |
+---
+
+## Deep Dive Documentation
+
+For a detailed breakdown of how to launch, evaluate, and scale this project, refer to the following documentation files:
+
+- 🚀 **[Deployment Guide](DEPLOYMENT.md)**: How to run this stack locally and deploy it to Oracle Cloud and Vercel.
+- 🏢 **[MVP vs. Production](MVP_VS_PRODUCTION.md)**: Architectural roadmap from this MVP to a million-user enterprise deployment (WavLM, Contextual ML, Relay Transceivers).
+- 📊 **[Evaluation Guide](EVALUATION.md)**: How we test non-deterministic AI pipelines (RAG Precision, PII Accuracy, Latency).
 
 ---
 
 ## FAQ
-
 **Q: Why is the main LLM Groq (LLaMA 3.3 70B) instead of Gemini?**
 A: Groq's custom LPU hardware delivers ~100ms time-to-first-token, which is critical for voice latency. Gemini's TTFT is ~400ms. For non-latency-critical tasks (semantic analysis, report generation), we still use Gemini.
-
 **Q: Why does the acoustic layer use both librosa AND HuBERT?**
 A: HuBERT excels at emotion classification on clean, long audio clips. But on short, noisy browser audio, it biases toward `neutral`. librosa provides deterministic physics-based features (pitch, volume) that catch cases the ML model misses. The 50/50 fusion with 4 physics override rules gives the best combined accuracy.
-
 **Q: Why AudioWorklet instead of MediaRecorder?**
 A: MediaRecorder outputs WebM/Opus containers, which require demuxing before Deepgram can process them as raw audio. AudioWorklet gives us direct access to raw PCM samples, allowing us to output both Int16 (for STT) and Float32 (for acoustic analysis) without re-encoding.
-
 **Q: What happens if the user's machine doesn't have a GPU?**
 A: HuBERT runs on CPU (slower but functional). If PyTorch itself fails to import, the acoustic layer falls back to **simulation mode** with realistic mock values. The pipeline never crashes.
-
 **Q: Why is Deepgram used for both STT and TTS instead of using ElevenLabs for TTS?**
 A: The original design used ElevenLabs for TTS. We migrated to Deepgram Aura because: (1) it supports persistent WebSocket TTS with `Speak`/`Flush`/`Clear` commands, which is ideal for cascaded streaming and barge-in, and (2) using the same provider for STT and TTS simplifies API key management.
-
 **Q: How does the speculative RAG avoid stale results?**
 A: When the final transcript arrives, its embedding is compared to the cached speculative embedding using cosine similarity. If `cos_sim > 0.85`, the cache is used. If the user changed topics mid-sentence (low similarity), the cache is discarded and a fresh search runs. The cache is always cleared after use.
-
 **Q: What's the backchannel word list?**
 A: English: "uh-huh", "hmm", "yeah", "okay", "sure", "alright", "got it", "go on", etc. Hindi: "haan", "ha", "accha", "theek", "sahi". Any utterance of ≤3 words containing only these words (and no "interrupt signal" words like "stop", "cancel", "balance") is classified as backchannel.
-
 ---
-
 <p align="center">
   <sub>Built with ❤️ for learning enterprise voice AI architecture</sub>
 </p>

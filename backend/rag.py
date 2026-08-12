@@ -1,23 +1,35 @@
 """
 miniVoxSetu — RAG (Retrieval-Augmented Generation) Engine
 
-WHY THIS FILE EXISTS:
-LLMs like Gemini/LLaMA are trained on public internet data — they know nothing about
-YOUR specific business (NeoBank in our case). RAG solves this by:
-1. Converting your domain knowledge (FAQ) into vector embeddings
-2. Storing those embeddings in a vector database (ChromaDB in production)
-3. On each user query, finding the most relevant knowledge chunks
-4. Injecting those chunks into the LLM prompt
+Production upgrade from MVP:
+  Phase 2: BM25 + Vector Hybrid Search with Reciprocal Rank Fusion (RRF)
+  Phase 3: Qdrant Vector Database (with SimpleVectorStore fallback for local dev)
+  Phase 4: Dynamic document ingestion support (see ingest.py)
+
+ARCHITECTURE:
+  Query → [BM25 Keyword Search] ─┐
+                                  ├─→ RRF Fusion → Top-N Results
+  Query → [Vector Similarity]  ──┘
 
 EMBEDDING MODEL:
-We use sentence-transformers/all-MiniLM-L6-v2 running locally on CPU.
-This eliminates the ~150ms API round-trip to Google's embedding endpoint.
-Local embedding takes ~5ms on CPU — a 30x speedup.
+  sentence-transformers/all-MiniLM-L6-v2 running locally on CPU.
+  Local embedding takes ~5ms on CPU — a 30x speedup over cloud APIs.
+
+VECTOR DATABASE MODES (set via VECTOR_DB_MODE env var):
+  "memory"  → In-memory SimpleVectorStore (default, no external deps)
+  "qdrant"  → Qdrant via qdrant-client (Docker or Qdrant Cloud)
 """
 
+import os
+import hashlib
 import numpy as np
+from typing import Optional
 
-# Local embedding model — loads once, stays in memory
+# ============================================================
+# DEPENDENCY IMPORTS (graceful fallback for each)
+# ============================================================
+
+# Embedding model
 try:
     from sentence_transformers import SentenceTransformer
     _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -28,95 +40,298 @@ except ImportError as e:
     EMBEDDINGS_AVAILABLE = False
     print(f"[RAG] ⚠️ sentence-transformers not installed: {e}. RAG will be disabled.")
 
+# BM25 keyword search
+try:
+    from rank_bm25 import BM25Okapi
+    BM25_AVAILABLE = True
+    print("[RAG] ✅ BM25 keyword search available (rank_bm25)")
+except ImportError:
+    BM25_AVAILABLE = False
+    print("[RAG] ⚠️ rank_bm25 not installed. Using vector-only retrieval.")
+
+# Qdrant vector database
+try:
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import (
+        Distance, VectorParams, PointStruct,
+        Filter, FieldCondition, MatchValue
+    )
+    QDRANT_AVAILABLE = True
+    print("[RAG] ✅ Qdrant client available")
+except ImportError:
+    QDRANT_AVAILABLE = False
+    print("[RAG] ⚠️ qdrant-client not installed. Using in-memory vector store.")
+
+# Vector dimension for all-MiniLM-L6-v2
+VECTOR_DIM = 384
+COLLECTION_NAME = "minivoxsetu_knowledge"
+
 
 # ============================================================
-# SIMPLE VECTOR STORE (mirrors ChromaDB's interface)
+# SIMPLE VECTOR STORE (in-memory fallback — original MVP code)
 # ============================================================
 
 class SimpleVectorStore:
     """
-    WHY THIS CLASS EXISTS:
-    In production, you'd use ChromaDB, Pinecone, Weaviate, or pgvector.
-    This is a minimal implementation that teaches the EXACT same concepts:
-    - Storing documents with their vector embeddings
-    - Querying by cosine similarity
-    - Returning the top-N most relevant documents
+    In-memory brute-force cosine similarity search.
+    Used as fallback when Qdrant is not available (local development).
 
-    The math is simple: cosine_similarity(A, B) = dot(A, B) / (|A| * |B|)
-    Similar texts have vectors pointing in the same direction → high cosine similarity.
-
-    ChromaDB equivalent:
-        collection = chroma_client.get_or_create_collection("neobank_faq")
-        collection.add(ids=[...], embeddings=[...], documents=[...])
-        results = collection.query(query_embeddings=[...], n_results=2)
+    Production equivalent: Qdrant HNSW index with payload filtering.
     """
 
     def __init__(self):
         self.documents = []      # List of document strings
         self.embeddings = []     # List of embedding vectors (numpy arrays)
         self.ids = []            # Document IDs
+        self._hashes = set()     # SHA256 hashes for deduplication
 
-    def add(self, ids, embeddings, documents):
+    def add(self, ids: list[str], embeddings: list, documents: list[str]):
+        """Store documents alongside their embeddings (deduplication by content hash)."""
+        for doc_id, embedding, doc in zip(ids, embeddings, documents):
+            doc_hash = hashlib.sha256(doc.encode()).hexdigest()
+            if doc_hash in self._hashes:
+                continue  # Skip duplicate content
+            self._hashes.add(doc_hash)
+            self.ids.append(doc_id)
+            self.documents.append(doc)
+            self.embeddings.append(np.array(embedding))
+
+    def query(self, query_embedding, n_results: int = 2) -> list[tuple[str, str, float]]:
         """
-        WHY: Store documents alongside their embeddings. This is the "indexing"
-        step — converting text to vectors and saving them for later search.
-        In ChromaDB: collection.add(ids=ids, embeddings=embeddings, documents=documents)
-        """
-        self.ids.extend(ids)
-        self.documents.extend(documents)
-        self.embeddings.extend([np.array(e) for e in embeddings])
-
-    def query(self, query_embedding, n_results=2):
-        """
-        WHY: Find the most similar documents to the query using cosine similarity.
-        This is the core of vector search — instead of matching KEYWORDS (like SQL LIKE),
-        we match MEANING. "How do I open an account?" matches a document about account
-        opening even if the exact words differ.
-
-        In ChromaDB: collection.query(query_embeddings=[query_emb], n_results=n)
-
-        HOW COSINE SIMILARITY WORKS:
-        Each embedding is a vector in high-dimensional space (384 dimensions for
-        all-MiniLM-L6-v2). Cosine similarity measures the angle between two vectors:
-        - cos(θ) = 1.0 → identical direction → identical meaning
-        - cos(θ) = 0.0 → perpendicular → unrelated
-        - cos(θ) = -1.0 → opposite → opposite meaning
+        Find most similar documents by cosine similarity.
+        Returns list of (doc_id, document_text, similarity_score).
         """
         if not self.embeddings:
             return []
 
         query_vec = np.array(query_embedding)
-
-        # WHY: We compute cosine similarity against ALL stored documents.
-        # In production with millions of docs, this brute-force approach is too slow
-        # and you'd use approximate nearest neighbor (ANN) algorithms like HNSW
-        # (which is exactly what ChromaDB uses internally via hnswlib).
         similarities = []
         for i, doc_vec in enumerate(self.embeddings):
-            # Cosine similarity formula: dot(A,B) / (||A|| * ||B||)
             cos_sim = np.dot(query_vec, doc_vec) / (
-                np.linalg.norm(query_vec) * np.linalg.norm(doc_vec)
+                np.linalg.norm(query_vec) * np.linalg.norm(doc_vec) + 1e-10
             )
-            similarities.append((i, cos_sim))
+            similarities.append((i, float(cos_sim)))
 
-        # WHY: Sort by similarity (highest first) and take top N
         similarities.sort(key=lambda x: x[1], reverse=True)
-        top_indices = [idx for idx, _ in similarities[:n_results]]
+        results = []
+        for idx, score in similarities[:n_results]:
+            results.append((self.ids[idx], self.documents[idx], score))
+        return results
 
-        return [self.documents[i] for i in top_indices]
+    def get_all_documents(self) -> list[tuple[str, str]]:
+        """Return all (id, document) pairs for BM25 indexing."""
+        return list(zip(self.ids, self.documents))
 
-    def count(self):
+    def count(self) -> int:
         return len(self.documents)
 
 
 # ============================================================
-# FAQ KNOWLEDGE BASE
+# QDRANT VECTOR STORE (production — Phase 3)
 # ============================================================
 
-# WHY: These are our "knowledge base" documents. In production, these would
-# come from a CMS, database, or document store. We hardcode them here for
-# learning purposes. Each string is a "chunk" — a self-contained piece of
-# information that can be retrieved independently.
+class QdrantVectorStore:
+    """
+    Qdrant-backed vector store with same interface as SimpleVectorStore.
+    Supports both local Docker and Qdrant Cloud connections.
+
+    ENV VARS:
+      QDRANT_URL      → Qdrant server URL (default: http://localhost:6333)
+      QDRANT_API_KEY   → API key for Qdrant Cloud (optional for local Docker)
+    """
+
+    def __init__(self):
+        qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+        qdrant_api_key = os.getenv("QDRANT_API_KEY")
+
+        if qdrant_api_key:
+            self.client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+            print(f"[RAG] Connected to Qdrant Cloud: {qdrant_url}")
+        else:
+            self.client = QdrantClient(url=qdrant_url)
+            print(f"[RAG] Connected to Qdrant (local): {qdrant_url}")
+
+        # Create collection if it doesn't exist
+        try:
+            collections = [c.name for c in self.client.get_collections().collections]
+            if COLLECTION_NAME not in collections:
+                self.client.create_collection(
+                    collection_name=COLLECTION_NAME,
+                    vectors_config=VectorParams(
+                        size=VECTOR_DIM,
+                        distance=Distance.COSINE
+                    )
+                )
+                print(f"[RAG] Created Qdrant collection: {COLLECTION_NAME}")
+            else:
+                print(f"[RAG] Using existing Qdrant collection: {COLLECTION_NAME}")
+        except Exception as e:
+            print(f"[RAG] ⚠️ Qdrant collection setup error: {e}")
+            raise
+
+        self._doc_cache = {}  # Local cache: id → document text
+
+    def add(self, ids: list[str], embeddings: list, documents: list[str]):
+        """Upsert documents into Qdrant collection."""
+        points = []
+        for doc_id, embedding, doc in zip(ids, embeddings, documents):
+            # Use hash of doc_id as integer point ID (Qdrant requires int or UUID)
+            point_id = int(hashlib.md5(doc_id.encode()).hexdigest()[:15], 16)
+            points.append(PointStruct(
+                id=point_id,
+                vector=embedding if isinstance(embedding, list) else embedding.tolist(),
+                payload={
+                    "doc_id": doc_id,
+                    "text": doc,
+                    "content_hash": hashlib.sha256(doc.encode()).hexdigest()
+                }
+            ))
+            self._doc_cache[doc_id] = doc
+
+        if points:
+            # Batch upsert (Qdrant handles dedup by point ID)
+            batch_size = 100
+            for i in range(0, len(points), batch_size):
+                self.client.upsert(
+                    collection_name=COLLECTION_NAME,
+                    points=points[i:i + batch_size]
+                )
+            print(f"[RAG] Upserted {len(points)} points to Qdrant")
+
+    def query(self, query_embedding, n_results: int = 2) -> list[tuple[str, str, float]]:
+        """Search Qdrant for similar documents. Returns list of (doc_id, text, score)."""
+        try:
+            results = self.client.search(
+                collection_name=COLLECTION_NAME,
+                query_vector=query_embedding if isinstance(query_embedding, list)
+                    else query_embedding.tolist(),
+                limit=n_results
+            )
+            return [
+                (hit.payload.get("doc_id", ""), hit.payload.get("text", ""), hit.score)
+                for hit in results
+            ]
+        except Exception as e:
+            print(f"[RAG] Qdrant search error: {e}")
+            return []
+
+    def get_all_documents(self) -> list[tuple[str, str]]:
+        """Retrieve all documents from Qdrant for BM25 indexing."""
+        try:
+            # Scroll through all points
+            all_docs = []
+            offset = None
+            while True:
+                results, offset = self.client.scroll(
+                    collection_name=COLLECTION_NAME,
+                    limit=100,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False
+                )
+                for point in results:
+                    doc_id = point.payload.get("doc_id", "")
+                    text = point.payload.get("text", "")
+                    all_docs.append((doc_id, text))
+                if offset is None:
+                    break
+            return all_docs
+        except Exception as e:
+            print(f"[RAG] Qdrant scroll error: {e}")
+            return list(self._doc_cache.items())
+
+    def count(self) -> int:
+        try:
+            info = self.client.get_collection(COLLECTION_NAME)
+            return info.points_count
+        except Exception:
+            return 0
+
+
+# ============================================================
+# BM25 KEYWORD INDEX (Phase 2)
+# ============================================================
+
+class BM25Index:
+    """
+    BM25Okapi keyword search index.
+    Tokenizes documents at index time and provides ranked keyword retrieval.
+
+    WHY BM25 alongside vector search:
+    - Vector search captures MEANING ("How do I open an account?" ≈ "account opening process")
+    - BM25 captures EXACT TERMS ("IFSC", "NEFT", "TDS 15G", specific product names)
+    - Hybrid = best of both worlds
+    """
+
+    def __init__(self):
+        self.bm25: Optional[BM25Okapi] = None
+        self.doc_ids: list[str] = []
+        self.documents: list[str] = []
+
+    def build_index(self, doc_pairs: list[tuple[str, str]]):
+        """Build BM25 index from (doc_id, document_text) pairs."""
+        if not BM25_AVAILABLE or not doc_pairs:
+            return
+
+        self.doc_ids = [doc_id for doc_id, _ in doc_pairs]
+        self.documents = [doc for _, doc in doc_pairs]
+
+        # Tokenize: simple whitespace + lowercasing
+        # For Indian banking domain, this works well since key terms
+        # (NEFT, IFSC, UPI, Aadhaar) are distinct tokens
+        tokenized = [doc.lower().split() for doc in self.documents]
+        self.bm25 = BM25Okapi(tokenized)
+        print(f"[RAG] BM25 index built with {len(self.documents)} documents")
+
+    def search(self, query: str, n_results: int = 10) -> list[str]:
+        """
+        Search BM25 index. Returns ranked list of doc_ids.
+        """
+        if self.bm25 is None:
+            return []
+
+        tokenized_query = query.lower().split()
+        scores = self.bm25.get_scores(tokenized_query)
+
+        # Get indices sorted by BM25 score (descending)
+        ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        return [self.doc_ids[i] for i in ranked_indices[:n_results]]
+
+
+# ============================================================
+# RECIPROCAL RANK FUSION (Phase 2)
+# ============================================================
+
+def reciprocal_rank_fusion(
+    ranked_lists: list[list[str]],
+    k: int = 60
+) -> list[str]:
+    """
+    Merge multiple ranked lists using Reciprocal Rank Fusion (RRF).
+
+    RRF formula: score(d) = Σ 1/(k + rank(d, r)) for each ranking r
+    - k=60 is the standard constant (smooths score distribution)
+    - Operates on RANK POSITIONS, not raw scores (avoids score normalization issues)
+
+    Returns: list of doc_ids sorted by fused score (highest first).
+    """
+    fused_scores: dict[str, float] = {}
+    for ranked_list in ranked_lists:
+        for rank, doc_id in enumerate(ranked_list):
+            fused_scores[doc_id] = fused_scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
+
+    return [
+        doc_id for doc_id, _
+        in sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+    ]
+
+
+# ============================================================
+# FAQ KNOWLEDGE BASE (seed data — migrated to file in Phase 4)
+# ============================================================
+
+# WHY KEPT: These serve as fallback seed data if no files exist in knowledge/ directory.
+# In production, documents are loaded from backend/knowledge/ via ingest.py.
 FAQ_DOCUMENTS = [
     # --- Account Types ---
     "NeoBank offers three account types: Basic Savings (zero balance, free), "
@@ -226,91 +441,192 @@ FAQ_DOCUMENTS = [
 ]
 
 
+# ============================================================
+# RAG ENGINE (unified interface)
+# ============================================================
 
 class RAGEngine:
     """
-    WHY THIS CLASS ENCAPSULATES ALL RAG LOGIC:
-    Separation of concerns — the main server shouldn't know HOW retrieval works,
-    just that it can call retrieve(query) and get relevant text back. This mirrors
-    production architecture where the RAG system is often a separate microservice.
+    Production RAG engine supporting:
+    - Dual vector store backends (Qdrant / SimpleVectorStore)
+    - Hybrid retrieval (BM25 + Vector + RRF fusion)
+    - Dynamic document ingestion from files
+    - Fallback to hardcoded FAQ if no files found
+
+    VECTOR_DB_MODE env var:
+      "memory" (default) → In-memory SimpleVectorStore
+      "qdrant"           → Qdrant (Docker or Cloud)
     """
 
     def __init__(self):
-        """
-        WHY: We load the local sentence-transformers model once.
-        No API key needed — embeddings are computed on-device (~5ms per query).
-        """
-        self.vector_store = SimpleVectorStore()
         self._model = _embedding_model  # Shared global model instance
+        self._bm25_index = BM25Index()
+
+        # Select vector store backend
+        db_mode = os.getenv("VECTOR_DB_MODE", "memory").lower()
+
+        if db_mode == "qdrant" and QDRANT_AVAILABLE:
+            try:
+                self.vector_store = QdrantVectorStore()
+                self._db_mode = "qdrant"
+                print("[RAG] Using Qdrant vector database")
+            except Exception as e:
+                print(f"[RAG] ⚠️ Qdrant connection failed, falling back to memory: {e}")
+                self.vector_store = SimpleVectorStore()
+                self._db_mode = "memory"
+        else:
+            self.vector_store = SimpleVectorStore()
+            self._db_mode = "memory"
+            if db_mode == "qdrant" and not QDRANT_AVAILABLE:
+                print("[RAG] ⚠️ VECTOR_DB_MODE=qdrant but qdrant-client not installed. Using memory.")
+            print("[RAG] Using in-memory vector store")
 
     def _embed_text(self, text: str) -> list[float]:
-        """
-        WHY: This converts human-readable text into a vector (list of numbers)
-        that captures its MEANING. Using local sentence-transformers model
-        instead of Gemini API — eliminates ~150ms network round-trip.
-        """
+        """Convert text to 384-dim vector using local sentence-transformers model."""
         if not self._model:
-            return [0.0] * 384  # Fallback zero vector
+            return [0.0] * VECTOR_DIM
         embedding = self._model.encode(text, convert_to_numpy=True)
         return embedding.tolist()
 
     def _embed_query(self, text: str) -> list[float]:
-        """
-        WHY: For symmetric models like all-MiniLM-L6-v2, query and document
-        embeddings use the same encoding (unlike Gemini which uses different
-        task_types). This simplifies the pipeline.
-        """
+        """Embed a query string. Same as _embed_text for symmetric models like MiniLM."""
         if not self._model:
-            return [0.0] * 384  # Fallback zero vector
+            return [0.0] * VECTOR_DIM
         embedding = self._model.encode(text, convert_to_numpy=True)
         return embedding.tolist()
 
-    def initialize(self):
+    def add_documents(self, documents: list[str], id_prefix: str = "doc"):
         """
-        WHY: We embed ALL FAQ documents at startup and store them in the vector store.
-        This is the "indexing" phase of RAG. In production, this would happen
-        offline (in a batch job) and the index would be persisted to disk.
-        With local sentence-transformers, embedding all 21 docs takes ~200ms on CPU.
+        Add documents to both vector store and BM25 index.
+        Called by ingest.py for dynamically loaded documents.
         """
-        # WHY: We check if docs already exist to avoid re-embedding on hot reload.
-        if self.vector_store.count() > 0:
-            print(f"[INFO] Vector store already has {self.vector_store.count()} documents, skipping embedding")
+        if not EMBEDDINGS_AVAILABLE:
+            print("[RAG] ⚠️ Skipping document embedding — sentence-transformers not available")
+            return
+
+        import time
+        start = time.time()
+
+        embeddings = [self._embed_text(doc) for doc in documents]
+        ids = [f"{id_prefix}_{i}" for i in range(len(documents))]
+
+        self.vector_store.add(ids=ids, embeddings=embeddings, documents=documents)
+
+        elapsed = round((time.time() - start) * 1000)
+        print(f"[RAG] Embedded and stored {len(documents)} documents in {elapsed}ms")
+
+        # Rebuild BM25 index with all documents
+        self._rebuild_bm25()
+
+    def _rebuild_bm25(self):
+        """Rebuild BM25 index from all documents currently in the vector store."""
+        if not BM25_AVAILABLE:
+            return
+        all_docs = self.vector_store.get_all_documents()
+        self._bm25_index.build_index(all_docs)
+
+    def initialize(self, external_documents: Optional[list[str]] = None):
+        """
+        Initialize the RAG engine:
+        1. If external_documents provided (from ingest.py), use those
+        2. Otherwise, if vector store is empty, embed the FAQ seed data
+        3. Build BM25 index from all documents
+
+        Args:
+            external_documents: Optional list of document chunks from ingest.py
+        """
+        if self.vector_store.count() > 0 and external_documents is None:
+            print(f"[RAG] Vector store already has {self.vector_store.count()} documents, skipping embedding")
+            # Still build BM25 index from existing documents
+            self._rebuild_bm25()
             return
 
         if not EMBEDDINGS_AVAILABLE:
             print("[RAG] ⚠️ Skipping FAQ embedding — sentence-transformers not available")
             return
 
-        print("[INFO] Embedding FAQ documents with local sentence-transformers...")
+        # Determine which documents to embed
+        if external_documents and len(external_documents) > 0:
+            docs_to_embed = external_documents
+            id_prefix = "ingested"
+            print(f"[RAG] Embedding {len(docs_to_embed)} ingested documents...")
+        else:
+            docs_to_embed = FAQ_DOCUMENTS
+            id_prefix = "faq"
+            print(f"[RAG] No external documents provided. Embedding {len(docs_to_embed)} FAQ seed documents...")
+
         import time
         start = time.time()
 
-        embeddings = []
-        for doc in FAQ_DOCUMENTS:
-            embedding = self._embed_text(doc)
-            embeddings.append(embedding)
-
-        # WHY: We add all documents in a single batch call. This is more efficient
-        # than adding one at a time — fewer round trips to the database.
+        embeddings = [self._embed_text(doc) for doc in docs_to_embed]
         self.vector_store.add(
-            ids=[f"faq_{i}" for i in range(len(FAQ_DOCUMENTS))],
+            ids=[f"{id_prefix}_{i}" for i in range(len(docs_to_embed))],
             embeddings=embeddings,
-            documents=FAQ_DOCUMENTS,
+            documents=docs_to_embed,
         )
+
         elapsed = round((time.time() - start) * 1000)
-        print(f"[OK] Embedded {len(FAQ_DOCUMENTS)} FAQ documents in {elapsed}ms (local CPU)")
+        print(f"[RAG] ✅ Embedded {len(docs_to_embed)} documents in {elapsed}ms (local CPU)")
+
+        # Build BM25 index
+        self._rebuild_bm25()
 
     def retrieve(self, query: str, n_results: int = 2) -> list[str]:
         """
-        WHY: This is the "retrieval" step that runs on EVERY user query.
-        We convert the user's question into a vector, then find the closest
-        document vectors in our store. "Closest" means "most semantically similar".
-        We return the top N results to inject into the LLM prompt.
+        Hybrid retrieval: BM25 keyword search + Vector similarity, merged via RRF.
 
-        With local embeddings, this takes ~5ms total (embed + search).
+        Pipeline:
+        1. BM25: Get top-10 keyword-matched doc_ids
+        2. Vector: Get top-10 semantically similar doc_ids
+        3. RRF: Fuse both ranked lists (k=60)
+        4. Return top n_results document texts
+
+        Falls back to vector-only if BM25 is unavailable.
         """
         if self.vector_store.count() == 0:
             return []
 
         query_embedding = self._embed_query(query)
-        return self.vector_store.query(query_embedding, n_results=n_results)
+
+        # Candidate retrieval pool size (retrieve more than needed for fusion)
+        pool_size = max(10, n_results * 5)
+
+        # --- Vector search path ---
+        vector_results = self.vector_store.query(query_embedding, n_results=pool_size)
+        vector_ranked_ids = [doc_id for doc_id, _, _ in vector_results]
+
+        # Build id → text lookup from vector results
+        id_to_text = {doc_id: text for doc_id, text, _ in vector_results}
+
+        # --- BM25 search path ---
+        if BM25_AVAILABLE and self._bm25_index.bm25 is not None:
+            bm25_ranked_ids = self._bm25_index.search(query, n_results=pool_size)
+
+            # Add BM25 results to text lookup (may include docs not in vector top-N)
+            all_docs = self.vector_store.get_all_documents()
+            all_docs_map = {doc_id: text for doc_id, text in all_docs}
+            for doc_id in bm25_ranked_ids:
+                if doc_id not in id_to_text:
+                    id_to_text[doc_id] = all_docs_map.get(doc_id, "")
+
+            # RRF fusion of both ranked lists
+            fused_ids = reciprocal_rank_fusion(
+                [vector_ranked_ids, bm25_ranked_ids],
+                k=60
+            )
+        else:
+            # Vector-only fallback
+            fused_ids = vector_ranked_ids
+
+        # Return top n_results document texts
+        results = []
+        for doc_id in fused_ids[:n_results]:
+            text = id_to_text.get(doc_id, "")
+            if text:
+                results.append(text)
+
+        return results
+
+    def get_query_embedding(self, query: str) -> list[float]:
+        """Expose query embedding for speculative RAG cache similarity checks."""
+        return self._embed_query(query)

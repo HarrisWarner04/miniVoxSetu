@@ -1,13 +1,35 @@
+*.env
 .env
+.env.*
+.env.example
 __pycache__/
 *.pyc
 node_modules/
+package-lock.json
+**/package-lock.json
 dist/
 .vite/
 Documentation/
 *.resolved
 
+# Docker and Deployment config ignores
+Dockerfile
+**/Dockerfile
+docker-compose.yml
+
+
+# Internal / Scratch documentation ignores
+DEPLOYMENT.md
+EVALUATION.md
+MVP_VS_PRODUCTION.md
+implementation_plan.md
+*Blueprint*.md
+backend/knowledge/README.md
+
 # Backend ignores
 .venv/
 .pipcache/
 backend/reports/
+
+
+

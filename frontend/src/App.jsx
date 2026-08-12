@@ -1,9 +1,10 @@
 /**
- * miniVoxSetu — Phase 1 Upgrade
- * STT: Deepgram (server-side) via streaming audio
- * TTS: ElevenLabs (server-side) via audio playback
+ * miniVoxSetu — Voice AI Pipeline
+ * STT: Deepgram Nova-2 (server-side) via streaming audio
+ * TTS: Deepgram Aura (server-side) via persistent WebSocket
+ * LLM: Groq LLaMA 3.3 70B (server-side) via SSE streaming
  * Mic: Always-on after start (no click-per-message)
- * Barge-in: Energy-based detection cancels TTS playback
+ * Barge-in: 7-layer detection system (B1–B7)
  */
 
 import { useState, useRef, useCallback, useEffect } from 'react';
@@ -105,9 +106,13 @@ function useWebSocket(url) {
 // ============================================================
 
 export default function App() {
-  // --- Connection ---
+  // Dynamic WebSocket URL:
+  // - Production: Set VITE_WS_URL env var (e.g., wss://your-oracle-ip:8000/ws/chat)
+  // - Dev: Falls back to same-origin via Vite proxy
+  const wsUrl = import.meta.env.VITE_WS_URL ||
+    `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/chat`;
   const { isConnected, sendJSON, sendBinary, setOnMessage, wsRef } =
-    useWebSocket('ws://localhost:8000/ws/chat');
+    useWebSocket(wsUrl);
 
   // --- Agent state machine ---
   const [agentState, setAgentState] = useState(STATES.IDLE);
@@ -163,16 +168,17 @@ export default function App() {
   // --- Refs ---
   const historyPanelRef = useRef(null);
   const pendingUtteranceRef = useRef('');
+  const currentTurnUserTextRef = useRef('');
 
   // Sync state to ref for use in callbacks
   useEffect(() => {
     agentStateRef.current = agentState;
 
-    // B3: Notify AudioWorklet of agent speaking state for VAD gating
-    if (audioWorkletNodeRef.current) {
+    // B3: Reset worklet speaking state when leaving SPEAKING state
+    if (agentState !== STATES.SPEAKING && audioWorkletNodeRef.current) {
       audioWorkletNodeRef.current.port.postMessage({
         type: 'agent_state',
-        speaking: agentState === STATES.SPEAKING,
+        speaking: false,
       });
     }
   }, [agentState]);
@@ -228,10 +234,12 @@ export default function App() {
             // Acoustic path: Float32 PCM → base64 JSON → HuBERT analysis
             const { samples, sampleRate } = event.data;
             const pcmBytes = new Uint8Array(samples.buffer);
+            // Fast base64 encoding using chunk-based approach
+            // (avoids O(n) string concatenation of the old per-byte loop)
+            const CHUNK_SIZE = 0x8000;
             let binary = '';
-            const len = pcmBytes.byteLength;
-            for (let i = 0; i < len; i++) {
-              binary += String.fromCharCode(pcmBytes[i]);
+            for (let i = 0; i < pcmBytes.length; i += CHUNK_SIZE) {
+              binary += String.fromCharCode.apply(null, pcmBytes.subarray(i, i + CHUNK_SIZE));
             }
             const base64 = btoa(binary);
             
@@ -327,6 +335,14 @@ export default function App() {
       mediaStreamRef.current = null;
     }
 
+    // Close AudioContext to free browser audio resources
+    if (audioContextRef.current) {
+      try {
+        audioContextRef.current.close();
+      } catch (e) {}
+      audioContextRef.current = null;
+    }
+
     setAgentState(STATES.IDLE);
   }, [sendJSON]);
 
@@ -354,6 +370,14 @@ export default function App() {
     }
     audioQueueRef.current = [];
     isPlayingRef.current = false;
+
+    // Reset worklet VAD speaking flag
+    if (audioWorkletNodeRef.current) {
+      audioWorkletNodeRef.current.port.postMessage({
+        type: 'agent_state',
+        speaking: false,
+      });
+    }
 
     // Tell backend to cancel pipeline
     sendJSON({ type: 'barge_in' });
@@ -411,10 +435,26 @@ export default function App() {
         // Play next queued audio or return to listening
         if (audioQueueRef.current.length > 0) {
           playNextAudio();
+        } else {
+          // No more audio, signal worklet that speaking stopped
+          if (audioWorkletNodeRef.current) {
+            audioWorkletNodeRef.current.port.postMessage({
+              type: 'agent_state',
+              speaking: false,
+            });
+          }
         }
       };
 
       source.start(0);
+
+      // Notify worklet that speaker is now actively outputting sound
+      if (audioWorkletNodeRef.current) {
+        audioWorkletNodeRef.current.port.postMessage({
+          type: 'agent_state',
+          speaking: true,
+        });
+      }
 
       // B2: Set TTS suppression window — let AEC settle before VAD resumes
       ttsSuppressUntilRef.current = Date.now() + 200;
@@ -431,6 +471,11 @@ export default function App() {
       // Try next in queue
       if (audioQueueRef.current.length > 0) {
         playNextAudio();
+      } else if (audioWorkletNodeRef.current) {
+        audioWorkletNodeRef.current.port.postMessage({
+          type: 'agent_state',
+          speaking: false,
+        });
       }
     }
   }, []);
@@ -478,7 +523,11 @@ export default function App() {
           if (message.state === 'THINKING') {
             setAgentState(STATES.THINKING);
             setStreamingResponse('');
-            setLiveTranscript(pendingUtteranceRef.current || '');
+            const textToSave = pendingUtteranceRef.current || liveTranscript || '';
+            if (textToSave) {
+              currentTurnUserTextRef.current = textToSave;
+              setLiveTranscript(textToSave);
+            }
             pendingUtteranceRef.current = '';
           } else if (message.state === 'SPEAKING') {
             bargedInRef.current = false; // Reset barge-in flag for new response
@@ -499,24 +548,30 @@ export default function App() {
           break;
 
         case 'audio':
-          // TTS audio from ElevenLabs (base64 mp3)
+          // TTS audio from Deepgram Aura (base64 mp3)
           queueAudio(message.data);
+          break;
+
+        case 'clear_audio':
+          // Backend triggered a barge-in (VAD), clear local queue immediately
+          handleBargeIn();
           break;
 
         case 'done': {
           const fullText = message.full_text || '';
           setConversationHistory((prev) => {
-            const userText = pendingUtteranceRef.current || liveTranscript || '';
+            const userText = currentTurnUserTextRef.current || pendingUtteranceRef.current || liveTranscript || '';
             const newHistory = [...prev];
             if (userText) {
               newHistory.push({ role: 'user', content: userText });
             }
-            newHistory.push({ role: 'assistant', content: fullText });
+            if (fullText) {
+              newHistory.push({ role: 'assistant', content: fullText });
+            }
             return newHistory;
           });
           setStreamingResponse('');
-          // State will be set to LISTENING by backend 'state' message
-          // or when all audio finishes playing
+          currentTurnUserTextRef.current = '';
           break;
         }
 
@@ -548,7 +603,11 @@ export default function App() {
           break;
       }
     });
-  }, [setOnMessage, queueAudio, liveTranscript]);
+    // NOTE: liveTranscript intentionally excluded from deps to prevent
+    // handler recreation on every transcript update (stale closure risk).
+    // The 'done' handler uses pendingUtteranceRef instead.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setOnMessage, queueAudio]);
 
   // ============================================================
   // MIC BUTTON HANDLER
@@ -629,7 +688,7 @@ export default function App() {
       <header className="header">
         <h1 className="header__title">miniVoxSetu</h1>
         <p className="header__subtitle">
-          Voice AI Pipeline — Deepgram STT → Gemini LLM → ElevenLabs TTS
+          Voice AI Pipeline — Deepgram STT → Groq LLM → Deepgram Aura TTS
         </p>
       </header>
 
@@ -1030,7 +1089,17 @@ export default function App() {
                   <p>Generating QA Report with Gemini...</p>
                 </div>
               ) : (
-                <div className="report-content markdown-body" dangerouslySetInnerHTML={{ __html: reportData.replace(/\n/g, '<br/>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/# (.*?)\<br\/\>/g, '<h3>$1</h3>') }} />
+                <div className="report-content markdown-body">
+                  {reportData.split('\n').map((line, i) => {
+                    // Simple markdown-like rendering without XSS risk
+                    if (line.startsWith('# ')) return <h3 key={i}>{line.slice(2)}</h3>;
+                    if (line.startsWith('## ')) return <h4 key={i}>{line.slice(3)}</h4>;
+                    if (line.startsWith('### ')) return <h5 key={i}>{line.slice(4)}</h5>;
+                    if (line.startsWith('- ')) return <li key={i}>{line.slice(2)}</li>;
+                    if (line.trim() === '') return <br key={i} />;
+                    return <p key={i}>{line}</p>;
+                  })}
+                </div>
               )}
             </div>
           </div>

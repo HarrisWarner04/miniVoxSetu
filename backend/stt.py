@@ -56,7 +56,7 @@ class DeepgramSTT:
             # Fallback for older versions
             return getattr(self.ws, 'open', False)
 
-    async def connect(self, on_transcript, on_utterance_end, on_confident_interim=None):
+    async def connect(self, on_transcript, on_utterance_end, on_confident_interim=None, on_speech_started=None):
         """
         Open WebSocket to Deepgram. Callbacks:
         - on_transcript(text, is_final, confidence): called on every transcript event
@@ -77,6 +77,7 @@ class DeepgramSTT:
         self._on_transcript = on_transcript
         self._on_utterance_end = on_utterance_end
         self._on_confident_interim = on_confident_interim
+        self._on_speech_started = on_speech_started
         self._final_segments = []
         self._bytes_sent = 0
         self._first_msg_logged = False
@@ -180,6 +181,8 @@ class DeepgramSTT:
                         
                 elif msg_type == "SpeechStarted":
                     print(f"[STT] 🎙️ Speech started detected by Deepgram VAD")
+                    if self._on_speech_started:
+                        await self._on_speech_started()
 
                 elif msg_type == "Error":
                     print(f"[STT] ❌ Deepgram ERROR: {json.dumps(data, indent=2)}")
