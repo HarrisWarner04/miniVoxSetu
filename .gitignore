@@ -12,10 +12,6 @@ dist/
 Documentation/
 *.resolved
 
-# Docker and Deployment config ignores
-Dockerfile
-**/Dockerfile
-docker-compose.yml
 
 
 # Internal / Scratch documentation ignores
