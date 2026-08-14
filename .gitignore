@@ -16,11 +16,11 @@ Documentation/
 
 # Internal / Scratch documentation ignores
 DEPLOYMENT.md
-EVALUATION.md
 MVP_VS_PRODUCTION.md
 implementation_plan.md
-*Blueprint*.md
 backend/knowledge/README.md
+JOURNEY.md
+miniVoxSetuJourney
 
 # Backend ignores
 .venv/

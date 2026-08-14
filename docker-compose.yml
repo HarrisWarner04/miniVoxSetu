@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   backend:
     build: 
@@ -8,11 +6,10 @@ services:
     container_name: minivoxsetu_backend
     ports:
       - "8000:8000"
+    env_file:
+      - ./backend/.env
     environment:
       # These will be read from the host environment or a .env file
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
-      - GROQ_API_KEY=${GROQ_API_KEY}
       - VECTOR_DB_MODE=qdrant
       - QDRANT_URL=http://qdrant:6333
       # Optimization for 12GB+ RAM instances
