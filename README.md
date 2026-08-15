@@ -8,6 +8,7 @@
 
 **Developer**: Harshawardhan Shrivastava  
 **Project Baseline**: [miniVoxSetu GitHub Repository](https://github.com/HarrisWarner04/miniVoxSetu)  
+**Demo Video**: https://drive.google.com/file/d/1G6ySJ6a4qunmbi7LL7BRzVw6A-p7Ve9t/view?usp=sharing
 **Domain**: Real-Time Multimodal Voice AI for Indian Banking (NeoBank Customer Service)  
 **Engineering Context**: Personal internship project built under mentor guidance to explore low-latency streaming architectures, real-time barge-in synchronization, acoustic feature extraction, and enterprise voice pipelines.
 
