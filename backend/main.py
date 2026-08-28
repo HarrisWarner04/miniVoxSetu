@@ -47,7 +47,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 # Groq API config
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "qwen/qwen3.8-27b"
 
 rag_engine: Optional[RAGEngine] = None
 
